@@ -1,0 +1,310 @@
+#!/usr/bin/env python3
+"""tmail - Taylor's API-driven multi-mailbox email client.
+
+Version: 2026-10-02
+Developed for Muse.ai agent emails.
+Credits: Taylor & Matthew Murphy - net30hosting.com
+
+Text-based, stdlib-only. Reads credentials at runtime from
+/home/taylor/TAYLOR-ACCESS.txt (0600) and never prints them.
+
+Usage:
+  tmail inboxes                      list accounts + unread counts
+  tmail unread [account]             unread messages (all or one account)
+  tmail list <account> [n=10]        recent messages
+  tmail read <account> <uid>         full message body (text)
+  tmail search <account> <query>     IMAP search (subject/from/body)
+  tmail reply <account> <uid> --body -    reply (body via stdin or --body TEXT)
+  tmail send <account> --to A --subject S --body -
+Account can be the full address or the domain part (e.g. boldteehub.com).
+"""
+import imaplib
+import os
+import re
+import smtplib
+import ssl
+import sys
+from email import policy
+from email.header import decode_header
+from email.message import EmailMessage
+from email.parser import BytesParser
+from email.utils import formatdate, getaddresses, make_msgid, parseaddr
+
+ACCESS_FILE = "/home/taylor/TAYLOR-ACCESS.txt"
+IMAP_HOST, IMAP_PORT = "mail.net30hosting.com", 993
+SMTP_HOST, SMTP_PORT = "mail.net30hosting.com", 587
+
+
+def load_accounts():
+    """Parse TAYLOR-ACCESS.txt -> {address: password}."""
+    accounts = {}
+    cur_addr, cur_pw = None, None
+    with open(ACCESS_FILE, encoding="utf-8", errors="replace") as f:
+        for line in f:
+            line = line.strip()
+            m = re.match(r"^(taylor@[A-Za-z0-9.\-]+)$", line)
+            if not m:
+                m = re.match(r"^address and username:\s*(taylor@[A-Za-z0-9.\-]+)$", line, re.I)
+            if m:
+                if cur_addr and cur_pw:
+                    accounts[cur_addr] = cur_pw
+                cur_addr, cur_pw = m.group(1).lower(), None
+                continue
+            m = re.match(r"^(?:new\s+)?password:\s*(.+)$", line, re.I)
+            if m and cur_addr and not cur_pw:
+                pw = m.group(1).strip()
+                if pw and pw.lower() != "<redacted>":
+                    cur_pw = pw
+    if cur_addr and cur_pw:
+        accounts[cur_addr] = cur_pw
+    return accounts
+
+
+def resolve(accounts, ident):
+    ident = ident.lower()
+    if ident in accounts:
+        return ident
+    matches = [a for a in accounts if a.endswith("@" + ident) or a == ident]
+    if len(matches) == 1:
+        return matches[0]
+    if not matches:
+        sys.exit(f"unknown account '{ident}'")
+    sys.exit(f"ambiguous account '{ident}': {', '.join(matches)}")
+
+
+def imap_connect(addr, pw):
+    ctx = ssl.create_default_context()
+    im = imaplib.IMAP4_SSL(IMAP_HOST, IMAP_PORT, ssl_context=ctx)
+    im.login(addr, pw)
+    return im
+
+
+def decode(h):
+    if not h:
+        return ""
+    parts = decode_header(h)
+    out = []
+    for text, enc in parts:
+        if isinstance(text, bytes):
+            out.append(text.decode(enc or "utf-8", errors="replace"))
+        else:
+            out.append(text)
+    return "".join(out)
+
+
+def msg_text(msg):
+    """Best text/plain body; fall back to stripped HTML."""
+    if msg.is_multipart():
+        for part in msg.walk():
+            if part.get_content_disposition() == "attachment":
+                continue
+            if part.get_content_type() == "text/plain":
+                return part.get_content()
+        for part in msg.walk():
+            if part.get_content_type() == "text/html":
+                html = part.get_content()
+                text = re.sub(r"<(script|style)[^>]*>.*?</\1>", "", html, flags=re.S | re.I)
+                text = re.sub(r"<[^>]+>", "", text)
+                return re.sub(r"\n{3,}", "\n\n", text).strip()
+        return ""
+    ctype = msg.get_content_type()
+    payload = msg.get_content()
+    if ctype == "text/html":
+        payload = re.sub(r"<[^>]+>", "", payload)
+    return payload.strip() if isinstance(payload, str) else ""
+
+
+def summary(im, uid):
+    typ, data = im.uid("fetch", uid, "(FLAGS BODY.PEEK[HEADER.FIELDS (FROM SUBJECT DATE MESSAGE-ID)])")
+    if typ != "OK" or not data or not data[0]:
+        return None
+    raw = data[0][1]
+    hdr = BytesParser(policy=policy.default).parsebytes(raw)
+    flags = imaplib.ParseFlags(data[0][0])
+    return {
+        "uid": uid,
+        "from": decode(hdr["From"]),
+        "subject": decode(hdr["Subject"]) or "(no subject)",
+        "date": hdr["Date"] or "",
+        "seen": b"\\Seen" in flags,
+    }
+
+
+def cmd_inboxes(accounts):
+    for addr in sorted(accounts):
+        try:
+            im = imap_connect(addr, accounts[addr])
+            im.select("INBOX", readonly=True)
+            typ, data = im.uid("search", None, "UNSEEN")
+            n = len(data[0].split()) if typ == "OK" and data[0] else 0
+            print(f"{addr}  unread={n}")
+            im.logout()
+        except Exception as e:
+            print(f"{addr}  ERROR: {e}")
+
+
+def cmd_list(accounts, ident, n=10):
+    addr = resolve(accounts, ident)
+    im = imap_connect(addr, accounts[addr])
+    im.select("INBOX", readonly=True)
+    typ, data = im.uid("search", None, "ALL")
+    uids = data[0].split() if typ == "OK" and data[0] else []
+    for uid in uids[-n:][::-1]:
+        s = summary(im, uid)
+        if s:
+            mark = " " if s["seen"] else "*"
+            print(f"{mark} {s['uid'].decode()} | {s['date'][:22]} | {s['from'][:40]} | {s['subject'][:60]}")
+    im.logout()
+
+
+def cmd_unread(accounts, ident=None):
+    targets = [resolve(accounts, ident)] if ident else sorted(accounts)
+    for addr in targets:
+        try:
+            im = imap_connect(addr, accounts[addr])
+            im.select("INBOX", readonly=True)
+            typ, data = im.uid("search", None, "UNSEEN")
+            uids = data[0].split() if typ == "OK" and data[0] else []
+            if uids:
+                print(f"== {addr} ({len(uids)} unread) ==")
+                for uid in uids[::-1][:20]:
+                    s = summary(im, uid)
+                    if s:
+                        print(f"  {s['uid'].decode()} | {s['date'][:22]} | {s['from'][:40]} | {s['subject'][:60]}")
+            im.logout()
+        except Exception as e:
+            print(f"{addr}  ERROR: {e}")
+
+
+def cmd_read(accounts, ident, uid):
+    addr = resolve(accounts, ident)
+    im = imap_connect(addr, accounts[addr])
+    im.select("INBOX")
+    typ, data = im.uid("fetch", uid, "(RFC822)")
+    if typ != "OK" or not data or not data[0]:
+        sys.exit("message not found")
+    msg = BytesParser(policy=policy.default).parsebytes(data[0][1])
+    print("From:", decode(msg["From"]))
+    print("To:", decode(msg["To"]))
+    print("Date:", msg["Date"] or "")
+    print("Subject:", decode(msg["Subject"]))
+    print("-" * 60)
+    print(msg_text(msg)[:8000])
+    im.logout()
+
+
+def cmd_search(accounts, ident, query):
+    addr = resolve(accounts, ident)
+    im = imap_connect(addr, accounts[addr])
+    im.select("INBOX", readonly=True)
+    crit = f'(OR (OR (SUBJECT "{query}") (FROM "{query}")) (BODY "{query}"))'
+    typ, data = im.uid("search", None, "CHARSET", "UTF-8", crit)
+    uids = data[0].split() if typ == "OK" and data[0] else []
+    for uid in uids[::-1][:20]:
+        s = summary(im, uid)
+        if s:
+            print(f"{s['uid'].decode()} | {s['date'][:22]} | {s['from'][:40]} | {s['subject'][:60]}")
+    if not uids:
+        print("no matches")
+    im.logout()
+
+
+def build_send(addr, to_addrs, subject, body, in_reply_to=None, references=None):
+    msg = EmailMessage()
+    msg["From"] = addr
+    msg["To"] = ", ".join(to_addrs)
+    msg["Subject"] = subject
+    msg["Date"] = formatdate(localtime=True)
+    msg["Message-ID"] = make_msgid(domain=addr.split("@")[1])
+    if in_reply_to:
+        msg["In-Reply-To"] = in_reply_to
+    if references:
+        msg["References"] = references
+    msg.set_content(body)
+    return msg
+
+
+def smtp_send(addr, pw, msg):
+    ctx = ssl.create_default_context()
+    with smtplib.SMTP(SMTP_HOST, SMTP_PORT) as s:
+        s.starttls(context=ctx)
+        s.login(addr, pw)
+        s.send_message(msg)
+
+
+def cmd_send(accounts, ident, to, subject, body):
+    addr = resolve(accounts, ident)
+    to_addrs = [t.strip() for t in to.split(",") if t.strip()]
+    msg = build_send(addr, to_addrs, subject, body)
+    smtp_send(addr, accounts[addr], msg)
+    print(f"sent from {addr} to {', '.join(to_addrs)}")
+
+
+def cmd_reply(accounts, ident, uid, body):
+    addr = resolve(accounts, ident)
+    im = imap_connect(addr, accounts[addr])
+    im.select("INBOX")
+    typ, data = im.uid("fetch", uid, "(RFC822)")
+    if typ != "OK" or not data or not data[0]:
+        sys.exit("message not found")
+    orig = BytesParser(policy=policy.default).parsebytes(data[0][1])
+    orig_from = parseaddr(str(orig["From"]))[1]
+    orig_subj = decode(orig["Subject"]) or ""
+    subj = orig_subj if orig_subj.lower().startswith("re:") else "Re: " + orig_subj
+    msg_id = str(orig["Message-ID"] or "").strip()
+    refs = str(orig["References"] or "").strip()
+    references = (refs + " " + msg_id).strip() if msg_id else refs
+    quoted = "\n".join("> " + l for l in msg_text(orig).splitlines()[:40])
+    full_body = body + "\n\nOn " + str(orig["Date"] or "") + ", " + decode(orig["From"]) + " wrote:\n" + quoted
+    msg = build_send(addr, [orig_from], subj, full_body,
+                     in_reply_to=msg_id or None, references=references or None)
+    smtp_send(addr, accounts[addr], msg)
+    im.uid("store", uid, "+FLAGS", "\\Answered")
+    im.logout()
+    print(f"replied from {addr} to {orig_from}")
+
+
+def get_body(args):
+    if "--body" in args:
+        i = args.index("--body")
+        b = args[i + 1]
+        return b if b != "-" else sys.stdin.read()
+    return sys.stdin.read()
+
+
+def main():
+    if len(sys.argv) < 2 or sys.argv[1] in ("-h", "--help", "help"):
+        print(__doc__)
+        return
+    accounts = load_accounts()
+    if not accounts:
+        sys.exit("no accounts parsed from " + ACCESS_FILE)
+    cmd, rest = sys.argv[1], sys.argv[2:]
+    if cmd == "inboxes":
+        cmd_inboxes(accounts)
+    elif cmd == "unread":
+        cmd_unread(accounts, rest[0] if rest else None)
+    elif cmd == "list" and rest:
+        cmd_list(accounts, rest[0], int(rest[1]) if len(rest) > 1 else 10)
+    elif cmd == "read" and len(rest) >= 2:
+        cmd_read(accounts, rest[0], rest[1])
+    elif cmd == "search" and len(rest) >= 2:
+        cmd_search(accounts, rest[0], " ".join(rest[1:]))
+    elif cmd == "send" and rest:
+        to = subj = None
+        for i, a in enumerate(rest):
+            if a == "--to" and i + 1 < len(rest):
+                to = rest[i + 1]
+            if a == "--subject" and i + 1 < len(rest):
+                subj = rest[i + 1]
+        if not to or not subj:
+            sys.exit("usage: tmail send <account> --to A --subject S --body -")
+        cmd_send(accounts, rest[0], to, subj, get_body(rest))
+    elif cmd == "reply" and len(rest) >= 2:
+        cmd_reply(accounts, rest[0], rest[1], get_body(rest))
+    else:
+        sys.exit("unknown command. See: tmail help")
+
+
+if __name__ == "__main__":
+    main()
