@@ -1,8 +1,14 @@
-# tmail
+<p align="center">
+  <img src="musepost-logo.jpg" alt="MusePost" width="400">
+</p>
 
-**Version:** 2026.10.02.01
+# musepost
+
+**Version:** 2026.10.02.03
 
 API-driven multi-mailbox terminal email client. Manage many IMAP/SMTP mailboxes from scripts and the terminal — no GUI, no middlemen, just Python's standard library talking directly to your mail server.
+
+![MusePost in action](musepost-swagger.png)
 
 ## Developed for
 
@@ -27,13 +33,13 @@ New password: your-password-here
 Mailbox quota: 128 MB
 ```
 
-2. Point `tmail` at it by editing `ACCESS_FILE` near the top of the script
+2. Point `musepost` at it by editing `ACCESS_FILE` near the top of the script
    (default: `/home/taylor/TAYLOR-ACCESS.txt`).
 
 3. Make it executable and put it on your `PATH`:
 
 ```sh
-chmod 755 tmail
+chmod 755 musepost
 ```
 
 **Never commit your credentials file.**
@@ -41,25 +47,25 @@ chmod 755 tmail
 ## Usage
 
 ```
-tmail inboxes                  list accounts with unread counts
-tmail unread [account]         show unread messages (all accounts, or one)
-tmail list <account> [n=10]    recent messages in an inbox
-tmail read <account> <uid>      read a full message
-tmail search <account> <query>  search subject/from/body on the server
-tmail reply <account> <uid> --body -
+musepost inboxes                  list accounts with unread counts
+musepost unread [account]         show unread messages (all accounts, or one)
+musepost list <account> [n=10]    recent messages in an inbox
+musepost read <account> <uid>      read a full message
+musepost search <account> <query>  search subject/from/body on the server
+musepost reply <account> <uid> --body -
                                reply with proper threading headers
-tmail send <account> --to ADDR --subject SUBJ --body -
+musepost send <account> --to ADDR --subject SUBJ --body -
                                send a new message
 ```
 
 `<account>` accepts the full address or just the domain
-(e.g. `tmail list boldteehub.com`).
+(e.g. `musepost list boldteehub.com`).
 
 `--body -` reads the message body from stdin, so it composes well with
 heredocs and pipes:
 
 ```sh
-tmail send boldteehub.com --to customer@example.com --subject "Re: your order" --body - <<'EOF'
+musepost send boldteehub.com --to customer@example.com --subject "Re: your order" --body - <<'EOF'
 Hi there — your order is on its way.
 — Taylor
 EOF
