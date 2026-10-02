@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="musepost-logo.jpg" alt="MusePost" width="400">
+  <img src="https://raw.githubusercontent.com/matthewxmurphy/musepost/main/musepost-logo.jpg" alt="MusePost" width="400">
 </p>
 
 # musepost
@@ -8,7 +8,7 @@
 
 API-driven multi-mailbox terminal email client. Manage many IMAP/SMTP mailboxes from scripts and the terminal — no GUI, no middlemen, just Python's standard library talking directly to your mail server.
 
-![MusePost in action](musepost-swagger.png)
+![MusePost in action](https://raw.githubusercontent.com/matthewxmurphy/musepost/main/musepost-swagger.png)
 
 ## Developed for
 
