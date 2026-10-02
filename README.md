@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="https://raw.githubusercontent.com/matthewxmurphy/musepost/main/musepost-logo.jpg" alt="MusePost" width="400">
+  <img src="https://raw.githubusercontent.com/matthewxmurphy/musepost/main/musepost-logo.png" alt="MusePost" width="400">
 </p>
 
 # musepost
