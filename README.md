@@ -14,7 +14,7 @@
 
 Multi-mailbox email client for AI agents and the terminal. Read, search, reply, and send across domains using IMAP and SMTP.
 
-![MusePost in action](https://raw.githubusercontent.com/matthewxmurphy/musepost/main/musepost-swagger.png)
+![MusePost terminal client](https://raw.githubusercontent.com/matthewxmurphy/musepost/main/musepost-terminal.png)
 
 ## Quick Start
 
