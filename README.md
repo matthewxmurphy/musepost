@@ -2,25 +2,34 @@
   <img src="https://raw.githubusercontent.com/matthewxmurphy/musepost/main/musepost-logo.png" alt="MusePost" width="400">
 </p>
 
-# musepost
+<h3 align="center">Every mailbox. One command.</h3>
 
-**Version:** 2026.10.02.03
+<p align="center">
+  <img src="https://img.shields.io/badge/python-3.8%2B-blue.svg" alt="Python 3.8+">
+  <img src="https://img.shields.io/badge/version-2026.10.02.03-orange.svg" alt="Version 2026.10.02.03">
+  <img src="https://img.shields.io/badge/stdlib-only-green.svg" alt="Standard library only">
+</p>
 
-API-driven multi-mailbox terminal email client. Manage many IMAP/SMTP mailboxes from scripts and the terminal — no GUI, no middlemen, just Python's standard library talking directly to your mail server.
+# MusePost
+
+Multi-mailbox email client for AI agents and the terminal. Read, search, reply, and send across domains using IMAP and SMTP.
 
 ![MusePost in action](https://raw.githubusercontent.com/matthewxmurphy/musepost/main/musepost-swagger.png)
 
-## Developed for
+## Quick Start
 
-**Muse.ai agent emails** — built to give an AI agent full command of 19 site mailboxes: listing, reading, searching, replying, and sending as the correct identity for each domain, all from the command line.
+```sh
+# List all mailboxes with unread counts
+musepost inboxes
 
-## Credits
+# Read recent messages
+musepost list net30hosting.com
 
-Taylor & Matthew Murphy — [net30hosting.com](https://net30hosting.com)
-
-## Requirements
-
-- Python 3.8+ (standard library only — no third-party packages)
+# Send an email
+musepost send net30hosting.com --to you@example.com --subject "Hello" --body - <<'EOF'
+Your message here.
+EOF
+```
 
 ## Setup
 
@@ -50,12 +59,12 @@ chmod 755 musepost
 musepost inboxes                  list accounts with unread counts
 musepost unread [account]         show unread messages (all accounts, or one)
 musepost list <account> [n=10]    recent messages in an inbox
-musepost read <account> <uid>      read a full message
-musepost search <account> <query>  search subject/from/body on the server
+musepost read <account> <uid>     read a full message
+musepost search <account> <query> search subject/from/body on the server
 musepost reply <account> <uid> --body -
-                               reply with proper threading headers
+                                  reply with proper threading headers
 musepost send <account> --to ADDR --subject SUBJ --body -
-                               send a new message
+                                  send a new message
 ```
 
 `<account>` accepts the full address or just the domain
@@ -74,7 +83,23 @@ EOF
 Replies set `In-Reply-To`/`References`, quote the original, and mark the
 original as answered. Every send uses the mailbox's own address as `From`.
 
-## Security notes
+## Signatures
+
+```sh
+# Set a signature for a mailbox (reads from stdin)
+musepost signature net30hosting.com --set <<'EOF'
+Taylor Quinn | Net30Hosting
+EOF
+
+# Show it, or delete it
+musepost signature net30hosting.com
+musepost signature net30hosting.com --delete
+```
+
+Signatures are appended automatically to sent messages and replies.
+Use `--no-signature` on any send or reply to skip it.
+
+## Security Notes
 
 - Passwords are read at runtime from your `0600` credentials file and never
   printed, logged, or stored elsewhere by this tool.
@@ -83,3 +108,11 @@ original as answered. Every send uses the mailbox's own address as `From`.
 ## Versioning
 
 `YYYY.MM.DD.BUILD` — date plus an incrementing build number for the day.
+
+## Developed For
+
+**Muse.ai agent emails** — built to give an AI agent full command of 19 site mailboxes: listing, reading, searching, replying, and sending as the correct identity for each domain, all from the command line.
+
+## Credits
+
+Taylor & Matthew Murphy — [net30hosting.com](https://net30hosting.com)
