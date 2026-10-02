@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """tmail - Taylor's API-driven multi-mailbox email client.
 
-Version: 2026-10-02
+Version: 2026.10.02.01
 Developed for Muse.ai agent emails.
 Credits: Taylor & Matthew Murphy - net30hosting.com
 
