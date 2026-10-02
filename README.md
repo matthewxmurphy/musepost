@@ -1,6 +1,6 @@
 # tmail
 
-**Version:** 2026-10-02
+**Version:** 2026.10.02.01
 
 API-driven multi-mailbox terminal email client. Manage many IMAP/SMTP mailboxes from scripts and the terminal — no GUI, no middlemen, just Python's standard library talking directly to your mail server.
 
@@ -73,3 +73,7 @@ original as answered. Every send uses the mailbox's own address as `From`.
 - Passwords are read at runtime from your `0600` credentials file and never
   printed, logged, or stored elsewhere by this tool.
 - All connections use TLS (IMAP SSL on 993, SMTP STARTTLS on 587).
+
+## Versioning
+
+`YYYY.MM.DD.BUILD` — date plus an incrementing build number for the day.
