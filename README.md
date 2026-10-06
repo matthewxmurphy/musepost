@@ -56,15 +56,22 @@ chmod 755 musepost
 ## Usage
 
 ```
-musepost inboxes                  list accounts with unread counts
-musepost unread [account]         show unread messages (all accounts, or one)
-musepost list <account> [n=10]    recent messages in an inbox
-musepost read <account> <uid>     read a full message
-musepost search <account> <query> search subject/from/body on the server
-musepost reply <account> <uid> --body -
+musepost inboxes [--json]         list accounts with unread counts
+musepost unread [account] [--json]
+                                  show unread messages (all accounts, or one)
+musepost list <account> [n=10] [--json]
+                                  recent messages in an inbox
+musepost read <account> <uid> [--json]
+                                  read a full message
+musepost search <account> <query> [--json]
+                                  search subject/from/body on the server
+musepost reply <account> <uid> --body - [--no-signature]
                                   reply with proper threading headers
-musepost send <account> --to ADDR --subject SUBJ --body -
+musepost send <account> --to ADDR --subject SUBJ --body - [--no-signature]
                                   send a new message
+musepost signature set <account> [--text TXT] [--html-file PATH]
+musepost signature show <account>
+musepost signature clear <account>
 ```
 
 `<account>` accepts the full address or just the domain
@@ -86,18 +93,29 @@ original as answered. Every send uses the mailbox's own address as `From`.
 ## Signatures
 
 ```sh
-# Set a signature for a mailbox (reads from stdin)
-musepost signature net30hosting.com --set <<'EOF'
-Taylor Quinn | Net30Hosting
-EOF
+# Set a signature for a mailbox (plain text and/or HTML file)
+musepost signature set taylor@taylorxquinn.com --text "Taylor Quinn | taylorxquinn.com" --html-file ~/taylor-email-signature.html
 
-# Show it, or delete it
-musepost signature net30hosting.com
-musepost signature net30hosting.com --delete
+# Show it, or clear it
+musepost signature show taylor@taylorxquinn.com
+musepost signature clear taylor@taylorxquinn.com
 ```
 
-Signatures are appended automatically to sent messages and replies.
+Signatures are stored per email address in `~/.config/musepost/signatures.json`
+(address, password, and signature rules travel together, one record per
+mailbox). They are applied automatically to sent messages and replies --
+multipart (plain + HTML) when an HTML signature exists.
 Use `--no-signature` on any send or reply to skip it.
+
+## JSON feed
+
+Every read command accepts `--json` and emits a machine-readable JSON feed
+instead of human text -- for scripts, dashboards, and agents:
+
+```sh
+musepost unread taylorxquinn.com --json
+musepost read taylorxquinn.com 12 --json
+```
 
 ## Security Notes
 
