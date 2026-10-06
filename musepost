@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """musepost - Taylor's API-driven multi-mailbox email client.
 
-Version: 2026.10.02.03
+Version: 2026.10.06.01
 Developed for Muse.ai agent emails.
 Credits: Taylor & Matthew Murphy - net30hosting.com
 
@@ -9,16 +9,28 @@ Text-based, stdlib-only. Reads credentials at runtime from
 /home/taylor/TAYLOR-ACCESS.txt (0600) and never prints them.
 
 Usage:
-  musepost inboxes                      list accounts + unread counts
-  musepost unread [account]             unread messages (all or one account)
-  musepost list <account> [n=10]        recent messages
-  musepost read <account> <uid>         full message body (text)
-  musepost search <account> <query>     IMAP search (subject/from/body)
-  musepost reply <account> <uid> --body -    reply (body via stdin or --body TEXT)
-  musepost send <account> --to A --subject S --body -
+  musepost inboxes [--json]              list accounts + unread counts
+  musepost unread [account] [--json]     unread messages (all or one account)
+  musepost list <account> [n=10] [--json]  recent messages
+  musepost read <account> <uid> [--json]   full message body (text)
+  musepost search <account> <query> [--json]  IMAP search (subject/from/body)
+  musepost reply <account> <uid> --body - [--no-signature]
+  musepost send <account> --to A --subject S --body - [--no-signature]
+  musepost signature set <account> [--text TXT] [--html-file PATH]
+  musepost signature show <account>
+  musepost signature clear <account>
 Account can be the full address or the domain part (e.g. boldteehub.com).
+
+Signatures: stored per email address in ~/.config/musepost/signatures.json
+(address -> {"text": ..., "html": ...}). send/reply apply the account's
+signature automatically unless --no-signature is passed. When an HTML
+signature exists the message goes out multipart (plain + HTML).
+
+--json: every read command (inboxes, unread, list, read, search) emits a
+JSON feed instead of human text, for programmatic consumers.
 """
 import imaplib
+import json
 import os
 import re
 import smtplib
@@ -31,6 +43,7 @@ from email.parser import BytesParser
 from email.utils import formatdate, getaddresses, make_msgid, parseaddr
 
 ACCESS_FILE = "/home/taylor/TAYLOR-ACCESS.txt"
+SIG_FILE = os.path.expanduser("~/.config/musepost/signatures.json")
 IMAP_HOST, IMAP_PORT = "mail.net30hosting.com", 993
 SMTP_HOST, SMTP_PORT = "mail.net30hosting.com", 587
 
@@ -58,6 +71,34 @@ def load_accounts():
     if cur_addr and cur_pw:
         accounts[cur_addr] = cur_pw
     return accounts
+
+
+def load_signatures():
+    """Per-address signature rules: {address: {"text": str, "html": str}}."""
+    try:
+        with open(SIG_FILE, encoding="utf-8") as f:
+            data = json.load(f)
+        return data if isinstance(data, dict) else {}
+    except (OSError, ValueError):
+        return {}
+
+
+def save_signatures(sigs):
+    os.makedirs(os.path.dirname(SIG_FILE), exist_ok=True)
+    with open(SIG_FILE, "w", encoding="utf-8") as f:
+        json.dump(sigs, f, indent=2)
+    os.chmod(SIG_FILE, 0o600)
+
+
+def get_signature(addr):
+    sig = load_signatures().get(addr.lower())
+    if not sig:
+        return None
+    text = (sig.get("text") or "").strip()
+    html_sig = (sig.get("html") or "").strip()
+    if not text and not html_sig:
+        return None
+    return {"text": text, "html": html_sig}
 
 
 def resolve(accounts, ident):
@@ -122,7 +163,7 @@ def summary(im, uid):
     hdr = BytesParser(policy=policy.default).parsebytes(raw)
     flags = imaplib.ParseFlags(data[0][0])
     return {
-        "uid": uid,
+        "uid": uid.decode() if isinstance(uid, bytes) else str(uid),
         "from": decode(hdr["From"]),
         "subject": decode(hdr["Subject"]) or "(no subject)",
         "date": hdr["Date"] or "",
@@ -130,53 +171,86 @@ def summary(im, uid):
     }
 
 
-def cmd_inboxes(accounts):
+def emit(obj, as_json):
+    if as_json:
+        print(json.dumps(obj, indent=2))
+    else:
+        raise AssertionError("text rendering handled by caller")
+
+
+def cmd_inboxes(accounts, as_json=False):
+    results = {}
     for addr in sorted(accounts):
         try:
             im = imap_connect(addr, accounts[addr])
             im.select("INBOX", readonly=True)
             typ, data = im.uid("search", None, "UNSEEN")
             n = len(data[0].split()) if typ == "OK" and data[0] else 0
-            print(f"{addr}  unread={n}")
+            results[addr] = {"unread": n}
             im.logout()
         except Exception as e:
-            print(f"{addr}  ERROR: {e}")
+            results[addr] = {"error": str(e)}
+    if as_json:
+        print(json.dumps(results, indent=2))
+    else:
+        for addr, r in results.items():
+            if "error" in r:
+                print(f"{addr}  ERROR: {r['error']}")
+            else:
+                print(f"{addr}  unread={r['unread']}")
 
 
-def cmd_list(accounts, ident, n=10):
+def cmd_list(accounts, ident, n=10, as_json=False):
     addr = resolve(accounts, ident)
     im = imap_connect(addr, accounts[addr])
     im.select("INBOX", readonly=True)
     typ, data = im.uid("search", None, "ALL")
     uids = data[0].split() if typ == "OK" and data[0] else []
+    items = []
     for uid in uids[-n:][::-1]:
         s = summary(im, uid)
         if s:
-            mark = " " if s["seen"] else "*"
-            print(f"{mark} {s['uid'].decode()} | {s['date'][:22]} | {s['from'][:40]} | {s['subject'][:60]}")
+            items.append(s)
     im.logout()
+    if as_json:
+        print(json.dumps({"account": addr, "messages": items}, indent=2))
+    else:
+        for s in items:
+            mark = " " if s["seen"] else "*"
+            print(f"{mark} {s['uid']} | {s['date'][:22]} | {s['from'][:40]} | {s['subject'][:60]}")
 
 
-def cmd_unread(accounts, ident=None):
+def cmd_unread(accounts, ident=None, as_json=False):
     targets = [resolve(accounts, ident)] if ident else sorted(accounts)
+    feed = {}
     for addr in targets:
         try:
             im = imap_connect(addr, accounts[addr])
             im.select("INBOX", readonly=True)
             typ, data = im.uid("search", None, "UNSEEN")
             uids = data[0].split() if typ == "OK" and data[0] else []
-            if uids:
-                print(f"== {addr} ({len(uids)} unread) ==")
-                for uid in uids[::-1][:20]:
-                    s = summary(im, uid)
-                    if s:
-                        print(f"  {s['uid'].decode()} | {s['date'][:22]} | {s['from'][:40]} | {s['subject'][:60]}")
+            items = []
+            for uid in uids[::-1][:20]:
+                s = summary(im, uid)
+                if s:
+                    items.append(s)
+            feed[addr] = {"unread": len(uids), "messages": items}
             im.logout()
         except Exception as e:
-            print(f"{addr}  ERROR: {e}")
+            feed[addr] = {"error": str(e)}
+    if as_json:
+        print(json.dumps(feed, indent=2))
+    else:
+        for addr, r in feed.items():
+            if "error" in r:
+                print(f"{addr}  ERROR: {r['error']}")
+            elif r["messages"]:
+                print(f"== {addr} ({r['unread']} unread) ==")
+                for s in r["messages"]:
+                    print(f"  {s['uid']} | {s['date'][:22]} | {s['from'][:40]} | {s['subject'][:60]}")
 
 
-def cmd_read(accounts, ident, uid):
+def cmd_read(accounts, ident, uid, as_json=False):
     addr = resolve(accounts, ident)
     im = imap_connect(addr, accounts[addr])
     im.select("INBOX")
@@ -184,32 +258,73 @@ def cmd_read(accounts, ident, uid):
     if typ != "OK" or not data or not data[0]:
         sys.exit("message not found")
     msg = BytesParser(policy=policy.default).parsebytes(data[0][1])
-    print("From:", decode(msg["From"]))
-    print("To:", decode(msg["To"]))
-    print("Date:", msg["Date"] or "")
-    print("Subject:", decode(msg["Subject"]))
-    print("-" * 60)
-    print(msg_text(msg)[:8000])
+    body = msg_text(msg)[:8000]
     im.logout()
+    if as_json:
+        print(json.dumps({
+            "account": addr,
+            "uid": str(uid),
+            "from": decode(msg["From"]),
+            "to": decode(msg["To"]),
+            "date": msg["Date"] or "",
+            "subject": decode(msg["Subject"]),
+            "body": body,
+        }, indent=2))
+    else:
+        print("From:", decode(msg["From"]))
+        print("To:", decode(msg["To"]))
+        print("Date:", msg["Date"] or "")
+        print("Subject:", decode(msg["Subject"]))
+        print("-" * 60)
+        print(body)
 
 
-def cmd_search(accounts, ident, query):
+def cmd_search(accounts, ident, query, as_json=False):
     addr = resolve(accounts, ident)
     im = imap_connect(addr, accounts[addr])
     im.select("INBOX", readonly=True)
     crit = f'(OR (OR (SUBJECT "{query}") (FROM "{query}")) (BODY "{query}"))'
     typ, data = im.uid("search", None, "CHARSET", "UTF-8", crit)
     uids = data[0].split() if typ == "OK" and data[0] else []
+    items = []
     for uid in uids[::-1][:20]:
         s = summary(im, uid)
         if s:
-            print(f"{s['uid'].decode()} | {s['date'][:22]} | {s['from'][:40]} | {s['subject'][:60]}")
-    if not uids:
-        print("no matches")
+            items.append(s)
     im.logout()
+    if as_json:
+        print(json.dumps({"account": addr, "query": query, "messages": items}, indent=2))
+    else:
+        for s in items:
+            print(f"{s['uid']} | {s['date'][:22]} | {s['from'][:40]} | {s['subject'][:60]}")
+        if not items:
+            print("no matches")
 
 
-def build_send(addr, to_addrs, subject, body, in_reply_to=None, references=None):
+def apply_signature(msg, body_text, signature):
+    """Attach per-address signature rules. Multipart when HTML is present."""
+    if not signature:
+        msg.set_content(body_text)
+        return body_text
+    text_sig = signature.get("text") or ""
+    html_sig = signature.get("html") or ""
+    plain = body_text + ("\n" + text_sig if text_sig else "")
+    if html_sig:
+        import html as htmlmod
+        body_html = htmlmod.escape(body_text).replace("\n", "<br>\n")
+        msg.set_content(plain)
+        msg.add_alternative(
+            '<div style="font-family: Arial, Helvetica, sans-serif;'
+            'font-size: 14px; color: #1a1a1a;">' + body_html + "</div>\n" + html_sig,
+            subtype="html",
+        )
+    else:
+        msg.set_content(plain)
+    return plain
+
+
+def build_send(addr, to_addrs, subject, body, in_reply_to=None, references=None,
+               signature=None):
     msg = EmailMessage()
     msg["From"] = addr
     msg["To"] = ", ".join(to_addrs)
@@ -220,7 +335,7 @@ def build_send(addr, to_addrs, subject, body, in_reply_to=None, references=None)
         msg["In-Reply-To"] = in_reply_to
     if references:
         msg["References"] = references
-    msg.set_content(body)
+    apply_signature(msg, body, signature)
     return msg
 
 
@@ -232,15 +347,16 @@ def smtp_send(addr, pw, msg):
         s.send_message(msg)
 
 
-def cmd_send(accounts, ident, to, subject, body):
+def cmd_send(accounts, ident, to, subject, body, use_signature=True):
     addr = resolve(accounts, ident)
     to_addrs = [t.strip() for t in to.split(",") if t.strip()]
-    msg = build_send(addr, to_addrs, subject, body)
+    sig = get_signature(addr) if use_signature else None
+    msg = build_send(addr, to_addrs, subject, body, signature=sig)
     smtp_send(addr, accounts[addr], msg)
     print(f"sent from {addr} to {', '.join(to_addrs)}")
 
 
-def cmd_reply(accounts, ident, uid, body):
+def cmd_reply(accounts, ident, uid, body, use_signature=True):
     addr = resolve(accounts, ident)
     im = imap_connect(addr, accounts[addr])
     im.select("INBOX")
@@ -256,12 +372,56 @@ def cmd_reply(accounts, ident, uid, body):
     references = (refs + " " + msg_id).strip() if msg_id else refs
     quoted = "\n".join("> " + l for l in msg_text(orig).splitlines()[:40])
     full_body = body + "\n\nOn " + str(orig["Date"] or "") + ", " + decode(orig["From"]) + " wrote:\n" + quoted
+    sig = get_signature(addr) if use_signature else None
     msg = build_send(addr, [orig_from], subj, full_body,
-                     in_reply_to=msg_id or None, references=references or None)
+                     in_reply_to=msg_id or None, references=references or None,
+                     signature=sig)
     smtp_send(addr, accounts[addr], msg)
     im.uid("store", uid, "+FLAGS", "\\Answered")
     im.logout()
     print(f"replied from {addr} to {orig_from}")
+
+
+def cmd_signature(accounts, action, ident=None, text=None, html_file=None):
+    sigs = load_signatures()
+    if action == "set":
+        if not ident:
+            sys.exit("usage: musepost signature set <account> [--text TXT] [--html-file PATH]")
+        addr = resolve(accounts, ident)
+        cur = sigs.get(addr, {})
+        if text is not None:
+            cur["text"] = text
+        if html_file:
+            with open(html_file, encoding="utf-8") as f:
+                cur["html"] = f.read()
+        if "text" not in cur:
+            cur["text"] = ""
+        if "html" not in cur:
+            cur["html"] = ""
+        sigs[addr] = cur
+        save_signatures(sigs)
+        print(f"signature set for {addr}")
+    elif action == "show":
+        if not ident:
+            sys.exit("usage: musepost signature show <account>")
+        addr = resolve(accounts, ident)
+        sig = sigs.get(addr)
+        if not sig:
+            print(f"no signature for {addr}")
+        else:
+            print(f"--- text signature for {addr} ---")
+            print(sig.get("text") or "(none)")
+            print(f"--- html signature for {addr} ({len(sig.get('html') or '')} chars) ---")
+            print(sig.get("html") or "(none)")
+    elif action == "clear":
+        if not ident:
+            sys.exit("usage: musepost signature clear <account>")
+        addr = resolve(accounts, ident)
+        sigs.pop(addr, None)
+        save_signatures(sigs)
+        print(f"signature cleared for {addr}")
+    else:
+        sys.exit("usage: musepost signature {set|show|clear} <account> [...] ")
 
 
 def get_body(args):
@@ -276,20 +436,27 @@ def main():
     if len(sys.argv) < 2 or sys.argv[1] in ("-h", "--help", "help"):
         print(__doc__)
         return
+    argv = sys.argv[1:]
+    as_json = False
+    if "--json" in argv:
+        as_json = True
+        argv = [a for a in argv if a != "--json"]
     accounts = load_accounts()
     if not accounts:
         sys.exit("no accounts parsed from " + ACCESS_FILE)
-    cmd, rest = sys.argv[1], sys.argv[2:]
+    cmd, rest = argv[0], argv[1:]
     if cmd == "inboxes":
-        cmd_inboxes(accounts)
+        cmd_inboxes(accounts, as_json=as_json)
     elif cmd == "unread":
-        cmd_unread(accounts, rest[0] if rest else None)
+        ident = rest[0] if rest and not rest[0].startswith("--") else None
+        cmd_unread(accounts, ident, as_json=as_json)
     elif cmd == "list" and rest:
-        cmd_list(accounts, rest[0], int(rest[1]) if len(rest) > 1 else 10)
+        cmd_list(accounts, rest[0], int(rest[1]) if len(rest) > 1 and rest[1].isdigit() else 10,
+                 as_json=as_json)
     elif cmd == "read" and len(rest) >= 2:
-        cmd_read(accounts, rest[0], rest[1])
+        cmd_read(accounts, rest[0], rest[1], as_json=as_json)
     elif cmd == "search" and len(rest) >= 2:
-        cmd_search(accounts, rest[0], " ".join(rest[1:]))
+        cmd_search(accounts, rest[0], " ".join(rest[1:]), as_json=as_json)
     elif cmd == "send" and rest:
         to = subj = None
         for i, a in enumerate(rest):
@@ -298,10 +465,22 @@ def main():
             if a == "--subject" and i + 1 < len(rest):
                 subj = rest[i + 1]
         if not to or not subj:
-            sys.exit("usage: musepost send <account> --to A --subject S --body -")
-        cmd_send(accounts, rest[0], to, subj, get_body(rest))
+            sys.exit("usage: musepost send <account> --to A --subject S --body - [--no-signature]")
+        cmd_send(accounts, rest[0], to, subj, get_body(rest),
+                 use_signature="--no-signature" not in rest)
     elif cmd == "reply" and len(rest) >= 2:
-        cmd_reply(accounts, rest[0], rest[1], get_body(rest))
+        cmd_reply(accounts, rest[0], rest[1], get_body(rest),
+                  use_signature="--no-signature" not in rest)
+    elif cmd == "signature" and rest:
+        action = rest[0]
+        ident = rest[1] if len(rest) > 1 else None
+        text = html_file = None
+        for i, a in enumerate(rest):
+            if a == "--text" and i + 1 < len(rest):
+                text = rest[i + 1]
+            if a == "--html-file" and i + 1 < len(rest):
+                html_file = rest[i + 1]
+        cmd_signature(accounts, action, ident, text, html_file)
     else:
         sys.exit("unknown command. See: musepost help")
 
