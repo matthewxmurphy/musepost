@@ -6,7 +6,7 @@
 
 <p align="center">
   <img src="https://img.shields.io/badge/python-3.8%2B-blue.svg" alt="Python 3.8+">
-  <img src="https://img.shields.io/badge/version-2026.10.02.03-orange.svg" alt="Version 2026.10.02.03">
+  <img src="https://img.shields.io/badge/version-2026.10.07.01-orange.svg" alt="Version 2026.10.07.01">
   <img src="https://img.shields.io/badge/stdlib-only-green.svg" alt="Standard library only">
 </p>
 
@@ -68,7 +68,8 @@ musepost search <account> <query> [--json]
 musepost reply <account> <uid> --body - [--no-signature]
                                   reply with proper threading headers
 musepost send <account> --to ADDR --subject SUBJ --body - [--no-signature]
-                                  send a new message
+              [--signature NAME] [--attach FILE]
+                                  send a new message (with optional file attachment)
 musepost signature set <account> [--text TXT] [--html-file PATH]
 musepost signature show <account>
 musepost signature clear <account>
@@ -122,6 +123,52 @@ musepost read taylorxquinn.com 12 --json
 - Passwords are read at runtime from your `0600` credentials file and never
   printed, logged, or stored elsewhere by this tool.
 - All connections use TLS (IMAP SSL on 993, SMTP STARTTLS on 587).
+
+## Display Names
+
+Set a friendly sender name so recipients see "Taylor Quinn" instead of a raw email address:
+
+```sh
+# ~/.config/musepost/display_names.json
+{"taylor@taylorxquinn.com": "Taylor Quinn"}
+```
+
+## Per-Address Server Overrides
+
+Override IMAP/SMTP hosts and ports per mailbox (for custom mail servers):
+
+```sh
+# ~/.config/musepost/servers.json
+{
+  "taylor@taylorxquinn.com": {
+    "imap_host": "mail.custom.com",
+    "imap_port": 993,
+    "smtp_host": "mail.custom.com",
+    "smtp_port": 587
+  }
+}
+```
+
+## Attachments
+
+Attach files to outgoing mail:
+
+```sh
+musepost send taylorxquinn.com --to friend@example.com --subject "Listen" \
+  --attach /path/to/audio.mp3 --body - <<'EOF'
+Here's that recording.
+EOF
+```
+
+## Changelog
+
+### v2026.10.07.01 (2026-10-07)
+- Display names: `From` header shows friendly name (e.g. "Taylor Quinn") via `~/.config/musepost/display_names.json`
+- Attachments: `--attach FILE` flag on `send` for file attachments (audio, images, documents)
+- Per-address server overrides: custom IMAP/SMTP hosts and ports via `~/.config/musepost/servers.json`
+
+### v2026.10.06.02
+- Per-address signature variants (desktop/iPhone)
 
 ## Versioning
 
