@@ -1,0 +1,34 @@
+# Mail credentials and local configuration; keep the placeholder example.
+*ACCESS*.txt
+*credentials*
+accounts.json
+servers.json
+display_names.json
+signatures.json
+.env
+.env.*
+!.env.example
+!example-config.json
+
+# Mail content and state belong outside the source repository.
+state/
+drafts/
+receipts/
+attachments/
+*.eml
+*.mbox
+*.sqlite*
+*.db
+*.log
+*.bak
+backups/
+
+# Python and OS artifacts.
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.pytest_cache/
+.coverage
+htmlcov/
+.DS_Store
