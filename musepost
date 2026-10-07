@@ -1,598 +1,692 @@
 #!/usr/bin/env python3
-"""musepost - Taylor's API-driven multi-mailbox email client.
+"""MusePost: multi-mailbox email for the terminal and AI agents.
 
-Version: 2026.10.07.01
 Developed for Muse.ai agent emails.
-Credits: Taylor & Matthew Murphy - net30hosting.com
-
-Text-based, stdlib-only. Reads credentials at runtime from
-/home/taylor/TAYLOR-ACCESS.txt (0600) and never prints them.
-
-Usage:
-  musepost inboxes [--json]              list accounts + unread counts
-  musepost unread [account] [--json]     unread messages (all or one account)
-  musepost list <account> [n=10] [--json]  recent messages
-  musepost read <account> <uid> [--json]   full message body (text)
-  musepost search <account> <query> [--json]  IMAP search (subject/from/body)
-  musepost reply <account> <uid> --body - [--no-signature] [--signature NAME]
-  musepost send <account> --to A --subject S --body - [--no-signature] [--signature NAME]
-  musepost signature set <account> [--name VARIANT] [--text TXT] [--html-file PATH]
-  musepost signature show <account>
-  musepost signature clear <account> [--name VARIANT]
-Account can be the full address or the domain part (e.g. boldteehub.com).
-
-Signatures: stored per email address in ~/.config/musepost/signatures.json.
-Each address can hold multiple named variants (e.g. "desktop", "iphone"):
-{address: {"variants": {"desktop": {"text":..,"html":..},
-"iphone": {"text":..,"html":..}}, "default": "desktop"}}.
-Old flat {"text":..,"html":..} entries migrate automatically to a "desktop"
-variant. send/reply pick a variant at RANDOM when more than one exists, so a
-message can look phone-sent ("Sent from my iPhone") or desktop-sent
-(branded HTML). --signature NAME forces one variant; --no-signature skips.
-When an HTML signature exists the message goes out multipart (plain + HTML).
-
---json: every read command (inboxes, unread, list, read, search) emits a
-JSON feed instead of human text, for programmatic consumers.
+Credits: Taylor & Matthew Murphy — net30hosting.com
+Previews and local drafts never submit mail. Use send, reply or drafts send
+explicitly to submit; SMTP acceptance does not confirm recipient delivery.
 """
-import imaplib
+
+import argparse
+from concurrent.futures import ThreadPoolExecutor
+from email.utils import parseaddr
 import json
+import math
 import os
-import random
-import re
-import smtplib
-import ssl
+from pathlib import Path
 import sys
-from email import policy
-from email.header import decode_header
-from email.message import EmailMessage
-from email.parser import BytesParser
-from email.utils import formataddr, formatdate, getaddresses, make_msgid, parseaddr
+import uuid
 
-ACCESS_FILE = "/home/taylor/TAYLOR-ACCESS.txt"
-SIG_FILE = os.path.expanduser("~/.config/musepost/signatures.json")
-IMAP_HOST, IMAP_PORT = "mail.net30hosting.com", 993
-SMTP_HOST, SMTP_PORT = "mail.net30hosting.com", 587
+import musepost_config as config
+import musepost_mail as mail
+import musepost_state as state
 
-def load_server_config():
-    path = os.path.expanduser("~/.config/musepost/servers.json")
+VERSION = Path(__file__).with_name("VERSION").read_text(encoding="utf-8").strip()
+SCHEMA_VERSION = 1
+
+
+class UsageError(Exception):
+    code = "USAGE_ERROR"
+    details = {}
+
+
+class Parser(argparse.ArgumentParser):
+    def error(self, message):
+        raise UsageError(message)
+
+
+def nonnegative(value):
     try:
-        with open(path) as f:
-            return json.load(f)
-    except (FileNotFoundError, json.JSONDecodeError):
-        return {}
+        number = int(value)
+        if number < 0:
+            raise ValueError()
+        return number
+    except ValueError:
+        raise argparse.ArgumentTypeError("must be a nonnegative integer") from None
 
-def get_servers_for(addr):
-    cfg = load_server_config().get(addr, {})
-    return (
-        cfg.get("imap_host", IMAP_HOST),
-        cfg.get("imap_port", IMAP_PORT),
-        cfg.get("smtp_host", SMTP_HOST),
-        cfg.get("smtp_port", SMTP_PORT),
+
+def positive(value):
+    number = nonnegative(value)
+    if number < 1:
+        raise argparse.ArgumentTypeError("must be a positive integer")
+    return number
+
+
+def timeout_value(value):
+    try:
+        number = float(value)
+        if not math.isfinite(number) or number <= 0:
+            raise ValueError()
+        return number
+    except ValueError:
+        raise argparse.ArgumentTypeError(
+            "must be a positive number of seconds"
+        ) from None
+
+
+def build_parser():
+    common = argparse.ArgumentParser(add_help=False)
+    common.add_argument(
+        "--config",
+        dest="config_path",
+        default=argparse.SUPPRESS,
+        help="owner-only JSON or legacy credentials file",
+    )
+    common.add_argument(
+        "--json",
+        dest="as_json",
+        action="store_true",
+        default=argparse.SUPPRESS,
+        help="emit schema_version 1 JSON",
+    )
+    common.add_argument(
+        "--timeout",
+        type=timeout_value,
+        default=argparse.SUPPRESS,
+        help="socket timeout in seconds (default: 30)",
+    )
+    parser = Parser(description=__doc__, parents=[common])
+    parser.add_argument("--version", action="version", version=VERSION)
+    commands = parser.add_subparsers(dest="command", required=True)
+
+    def command(name, description):
+        return commands.add_parser(name, help=description, parents=[common])
+
+    def folder(p):
+        p.add_argument("--folder", default="INBOX")
+
+    def compose(p):
+        p.add_argument("--body", default="-", help="text or - for stdin")
+        p.add_argument("--attach", action="append", default=[], metavar="FILE")
+        p.add_argument("--signature", metavar="NAME")
+        p.add_argument("--no-signature", action="store_true")
+        p.add_argument(
+            "--request-id",
+            help="persistent retry key; same request never submits twice",
+        )
+        mode = p.add_mutually_exclusive_group()
+        mode.add_argument(
+            "--preview", action="store_true", help="compose without submission"
+        )
+        mode.add_argument(
+            "--draft",
+            action="store_true",
+            help="save a private local draft without submission",
+        )
+
+    command("inboxes", "unread counts across accounts")
+    p = command("unread", "unread headers across accounts")
+    p.add_argument("account", nargs="?")
+    p.add_argument("--limit", type=nonnegative, default=20)
+    folder(p)
+    p = command("list", "recent message headers")
+    p.add_argument("account")
+    p.add_argument("n", nargs="?", type=nonnegative, help="legacy message limit")
+    p.add_argument("--limit", type=nonnegative)
+    folder(p)
+    for name in ("read", "peek"):
+        p = command(name, "full message without changing its unread flag")
+        p.add_argument("account")
+        p.add_argument("uid", type=positive)
+        p.add_argument(
+            "--limit",
+            type=nonnegative,
+            help="optional body-character limit; reports truncation",
+        )
+        if name == "read":
+            p.add_argument("--mark-read", action="store_true")
+        folder(p)
+    p = command("search", "search subject, sender and body")
+    p.add_argument("account")
+    p.add_argument("query", nargs="+")
+    p.add_argument("--limit", type=nonnegative, default=20)
+    folder(p)
+    p = command("send", "explicitly submit new mail")
+    p.add_argument("account")
+    p.add_argument("--to", required=True)
+    p.add_argument("--cc")
+    p.add_argument("--subject", required=True)
+    compose(p)
+    p = command("reply", "explicitly submit a threaded reply")
+    p.add_argument("account")
+    p.add_argument("uid", type=positive)
+    folder(p)
+    compose(p)
+    p = command("folders", "list mailbox folders")
+    p.add_argument("account")
+    p = command("attachment", "download an attachment without marking mail read")
+    p.add_argument("account")
+    p.add_argument("uid", type=positive)
+    p.add_argument("index", type=positive, help="1-based index from read output")
+    p.add_argument(
+        "--output",
+        required=True,
+        help="new file or existing directory; never overwrites",
+    )
+    folder(p)
+    p = command("signature", "manage deterministic signature variants")
+    actions = p.add_subparsers(dest="action", required=True)
+    for action in ("set", "show", "clear"):
+        child = actions.add_parser(action, parents=[common])
+        child.add_argument("account")
+        if action != "show":
+            child.add_argument("--name")
+        if action == "set":
+            child.add_argument("--text")
+            child.add_argument("--html-file")
+            child.add_argument("--default", action="store_true")
+    p = command("drafts", "list, inspect, send or delete private local drafts")
+    actions = p.add_subparsers(dest="action", required=True)
+    for action in ("list", "show", "send", "delete"):
+        child = actions.add_parser(action, parents=[common])
+        if action != "list":
+            child.add_argument("draft_id")
+    p = command("receipts", "inspect SMTP submission receipts")
+    p.add_argument("request_id", nargs="?")
+    return parser
+
+
+def redact(value, accounts):
+    secrets = [a.get("password") for a in accounts.values() if a.get("password")]
+
+    def clean(item):
+        if isinstance(item, str):
+            for secret in secrets:
+                item = item.replace(secret, "[REDACTED]")
+            return item
+        if isinstance(item, dict):
+            return {
+                clean(str(k)): clean(v)
+                for k, v in item.items()
+                if str(k).lower() != "password"
+            }
+        if isinstance(item, (tuple, list)):
+            return [clean(v) for v in item]
+        return item
+
+    return clean(value)
+
+
+def terminal(value):
+    # Incoming messages may contain terminal escape/clipboard commands.
+    return "".join(
+        c
+        if c in "\n\t" or (ord(c) >= 32 and not 127 <= ord(c) <= 159)
+        else "\\x{:02x}".format(ord(c))
+        for c in str(value)
     )
 
-def load_display_names():
-    path = os.path.expanduser("~/.config/musepost/display_names.json")
-    try:
-        with open(path) as f:
-            return json.load(f)
-    except (FileNotFoundError, json.JSONDecodeError):
-        return {}
 
-def format_from(addr):
-    name = load_display_names().get(addr)
-    if name:
-        return formataddr((name, addr))
-    return addr
-
-
-def load_accounts():
-    """Parse TAYLOR-ACCESS.txt -> {address: password}."""
-    accounts = {}
-    cur_addr, cur_pw = None, None
-    with open(ACCESS_FILE, encoding="utf-8", errors="replace") as f:
-        for line in f:
-            line = line.strip()
-            m = re.match(r"^(taylor@[A-Za-z0-9.\-]+)$", line)
-            if not m:
-                m = re.match(r"^address and username:\s*(taylor@[A-Za-z0-9.\-]+)$", line, re.I)
-            if m:
-                if cur_addr and cur_pw:
-                    accounts[cur_addr] = cur_pw
-                cur_addr, cur_pw = m.group(1).lower(), None
-                continue
-            m = re.match(r"^(?:new\s+)?password:\s*(.+)$", line, re.I)
-            if m and cur_addr and not cur_pw:
-                pw = m.group(1).strip()
-                if pw and pw.lower() != "<redacted>":
-                    cur_pw = pw
-    if cur_addr and cur_pw:
-        accounts[cur_addr] = cur_pw
-    return accounts
-
-
-def load_signatures():
-    """Per-address signature rules (see module docstring for format)."""
-    try:
-        with open(SIG_FILE, encoding="utf-8") as f:
-            data = json.load(f)
-        return data if isinstance(data, dict) else {}
-    except (OSError, ValueError):
-        return {}
-
-
-def save_signatures(sigs):
-    os.makedirs(os.path.dirname(SIG_FILE), exist_ok=True)
-    with open(SIG_FILE, "w", encoding="utf-8") as f:
-        json.dump(sigs, f, indent=2)
-    os.chmod(SIG_FILE, 0o600)
-
-
-def normalize_sig_entry(entry):
-    """Migrate legacy flat {"text":..,"html":..} to {"variants":{...},"default":..}."""
-    if not isinstance(entry, dict):
-        return {"variants": {}, "default": "desktop"}
-    if "variants" in entry:
-        variants = entry.get("variants") or {}
-        default = entry.get("default") or "desktop"
-        if default not in variants and variants:
-            default = sorted(variants)[0]
-        return {"variants": variants, "default": default}
-    text = (entry.get("text") or "").strip()
-    html_sig = (entry.get("html") or "").strip()
-    if not text and not html_sig:
-        return {"variants": {}, "default": "desktop"}
-    return {"variants": {"desktop": {"text": text, "html": html_sig}},
-            "default": "desktop"}
-
-
-def get_signature(addr, name=None):
-    """Pick a signature variant. Random when several exist and none named."""
-    norm = normalize_sig_entry(load_signatures().get(addr.lower()))
-    variants = norm["variants"]
-    if not variants:
-        return None
-    if name:
-        sig = variants.get(name)
-        if not sig:
-            sys.exit(f"unknown signature '{name}' for {addr} "
-                     f"(have: {', '.join(sorted(variants))})")
-    elif len(variants) == 1:
-        sig = next(iter(variants.values()))
-    else:
-        sig = random.choice(list(variants.values()))
-    text = (sig.get("text") or "").strip()
-    html_sig = (sig.get("html") or "").strip()
-    if not text and not html_sig:
-        return None
-    return {"text": text, "html": html_sig}
-
-
-def resolve(accounts, ident):
-    ident = ident.lower()
-    if ident in accounts:
-        return ident
-    matches = [a for a in accounts if a.endswith("@" + ident) or a == ident]
-    if len(matches) == 1:
-        return matches[0]
-    if not matches:
-        sys.exit(f"unknown account '{ident}'")
-    sys.exit(f"ambiguous account '{ident}': {', '.join(matches)}")
-
-
-def imap_connect(addr, pw):
-    ctx = ssl.create_default_context()
-    imap_host, imap_port, _, _ = get_servers_for(addr)
-    im = imaplib.IMAP4_SSL(imap_host, imap_port, ssl_context=ctx)
-    im.login(addr, pw)
-    return im
-
-
-def decode(h):
-    if not h:
-        return ""
-    parts = decode_header(h)
-    out = []
-    for text, enc in parts:
-        if isinstance(text, bytes):
-            out.append(text.decode(enc or "utf-8", errors="replace"))
-        else:
-            out.append(text)
-    return "".join(out)
-
-
-def msg_text(msg):
-    """Best text/plain body; fall back to stripped HTML."""
-    if msg.is_multipart():
-        for part in msg.walk():
-            if part.get_content_disposition() == "attachment":
-                continue
-            if part.get_content_type() == "text/plain":
-                return part.get_content()
-        for part in msg.walk():
-            if part.get_content_type() == "text/html":
-                html = part.get_content()
-                text = re.sub(r"<(script|style)[^>]*>.*?</\1>", "", html, flags=re.S | re.I)
-                text = re.sub(r"<[^>]+>", "", text)
-                return re.sub(r"\n{3,}", "\n\n", text).strip()
-        return ""
-    ctype = msg.get_content_type()
-    payload = msg.get_content()
-    if ctype == "text/html":
-        payload = re.sub(r"<[^>]+>", "", payload)
-    return payload.strip() if isinstance(payload, str) else ""
-
-
-def summary(im, uid):
-    typ, data = im.uid("fetch", uid, "(FLAGS BODY.PEEK[HEADER.FIELDS (FROM SUBJECT DATE MESSAGE-ID)])")
-    if typ != "OK" or not data or not data[0]:
-        return None
-    raw = data[0][1]
-    hdr = BytesParser(policy=policy.default).parsebytes(raw)
-    flags = imaplib.ParseFlags(data[0][0])
-    return {
-        "uid": uid.decode() if isinstance(uid, bytes) else str(uid),
-        "from": decode(hdr["From"]),
-        "subject": decode(hdr["Subject"]) or "(no subject)",
-        "date": hdr["Date"] or "",
-        "seen": b"\\Seen" in flags,
-    }
-
-
-def emit(obj, as_json):
+def output(result, as_json=False):
+    result = {"schema_version": SCHEMA_VERSION, **result}
     if as_json:
-        print(json.dumps(obj, indent=2))
-    else:
-        raise AssertionError("text rendering handled by caller")
-
-
-def cmd_inboxes(accounts, as_json=False):
-    results = {}
-    for addr in sorted(accounts):
-        try:
-            im = imap_connect(addr, accounts[addr])
-            im.select("INBOX", readonly=True)
-            typ, data = im.uid("search", None, "UNSEEN")
-            n = len(data[0].split()) if typ == "OK" and data[0] else 0
-            results[addr] = {"unread": n}
-            im.logout()
-        except Exception as e:
-            results[addr] = {"error": str(e)}
-    if as_json:
-        print(json.dumps(results, indent=2))
-    else:
-        for addr, r in results.items():
-            if "error" in r:
-                print(f"{addr}  ERROR: {r['error']}")
-            else:
-                print(f"{addr}  unread={r['unread']}")
-
-
-def cmd_list(accounts, ident, n=10, as_json=False):
-    addr = resolve(accounts, ident)
-    im = imap_connect(addr, accounts[addr])
-    im.select("INBOX", readonly=True)
-    typ, data = im.uid("search", None, "ALL")
-    uids = data[0].split() if typ == "OK" and data[0] else []
-    items = []
-    for uid in uids[-n:][::-1]:
-        s = summary(im, uid)
-        if s:
-            items.append(s)
-    im.logout()
-    if as_json:
-        print(json.dumps({"account": addr, "messages": items}, indent=2))
-    else:
-        for s in items:
-            mark = " " if s["seen"] else "*"
-            print(f"{mark} {s['uid']} | {s['date'][:22]} | {s['from'][:40]} | {s['subject'][:60]}")
-
-
-def cmd_unread(accounts, ident=None, as_json=False):
-    targets = [resolve(accounts, ident)] if ident else sorted(accounts)
-    feed = {}
-    for addr in targets:
-        try:
-            im = imap_connect(addr, accounts[addr])
-            im.select("INBOX", readonly=True)
-            typ, data = im.uid("search", None, "UNSEEN")
-            uids = data[0].split() if typ == "OK" and data[0] else []
-            items = []
-            for uid in uids[::-1][:20]:
-                s = summary(im, uid)
-                if s:
-                    items.append(s)
-            feed[addr] = {"unread": len(uids), "messages": items}
-            im.logout()
-        except Exception as e:
-            feed[addr] = {"error": str(e)}
-    if as_json:
-        print(json.dumps(feed, indent=2))
-    else:
-        for addr, r in feed.items():
-            if "error" in r:
-                print(f"{addr}  ERROR: {r['error']}")
-            elif r["messages"]:
-                print(f"== {addr} ({r['unread']} unread) ==")
-                for s in r["messages"]:
-                    print(f"  {s['uid']} | {s['date'][:22]} | {s['from'][:40]} | {s['subject'][:60]}")
-
-
-def cmd_read(accounts, ident, uid, as_json=False):
-    addr = resolve(accounts, ident)
-    im = imap_connect(addr, accounts[addr])
-    im.select("INBOX")
-    typ, data = im.uid("fetch", uid, "(RFC822)")
-    if typ != "OK" or not data or not data[0]:
-        sys.exit("message not found")
-    msg = BytesParser(policy=policy.default).parsebytes(data[0][1])
-    body = msg_text(msg)[:8000]
-    im.logout()
-    if as_json:
-        print(json.dumps({
-            "account": addr,
-            "uid": str(uid),
-            "from": decode(msg["From"]),
-            "to": decode(msg["To"]),
-            "date": msg["Date"] or "",
-            "subject": decode(msg["Subject"]),
-            "body": body,
-        }, indent=2))
-    else:
-        print("From:", decode(msg["From"]))
-        print("To:", decode(msg["To"]))
-        print("Date:", msg["Date"] or "")
-        print("Subject:", decode(msg["Subject"]))
-        print("-" * 60)
-        print(body)
-
-
-def cmd_search(accounts, ident, query, as_json=False):
-    addr = resolve(accounts, ident)
-    im = imap_connect(addr, accounts[addr])
-    im.select("INBOX", readonly=True)
-    crit = f'(OR (OR (SUBJECT "{query}") (FROM "{query}")) (BODY "{query}"))'
-    typ, data = im.uid("search", None, "CHARSET", "UTF-8", crit)
-    uids = data[0].split() if typ == "OK" and data[0] else []
-    items = []
-    for uid in uids[::-1][:20]:
-        s = summary(im, uid)
-        if s:
-            items.append(s)
-    im.logout()
-    if as_json:
-        print(json.dumps({"account": addr, "query": query, "messages": items}, indent=2))
-    else:
-        for s in items:
-            print(f"{s['uid']} | {s['date'][:22]} | {s['from'][:40]} | {s['subject'][:60]}")
-        if not items:
-            print("no matches")
-
-
-def apply_signature(msg, body_text, signature):
-    """Attach per-address signature rules. Multipart when HTML is present."""
-    if not signature:
-        msg.set_content(body_text)
-        return body_text
-    text_sig = signature.get("text") or ""
-    html_sig = signature.get("html") or ""
-    plain = body_text + ("\n" + text_sig if text_sig else "")
-    if html_sig:
-        import html as htmlmod
-        body_html = htmlmod.escape(body_text).replace("\n", "<br>\n")
-        msg.set_content(plain)
-        msg.add_alternative(
-            '<div style="font-family: Arial, Helvetica, sans-serif;'
-            'font-size: 14px; color: #1a1a1a;">' + body_html + "</div>\n" + html_sig,
-            subtype="html",
+        print(json.dumps(result, ensure_ascii=True, indent=2))
+    elif "error" in result and "status" not in result:
+        print(
+            terminal(
+                "{}: {}".format(result["error"]["code"], result["error"]["message"])
+            ),
+            file=sys.stderr,
         )
-    else:
-        msg.set_content(plain)
-    return plain
-
-
-def build_send(addr, to_addrs, subject, body, in_reply_to=None, references=None,
-               signature=None, attachments=None):
-    msg = EmailMessage()
-    msg["From"] = format_from(addr)
-    msg["To"] = ", ".join(to_addrs)
-    msg["Subject"] = subject
-    msg["Date"] = formatdate(localtime=True)
-    msg["Message-ID"] = make_msgid(domain=addr.split("@")[1])
-    if in_reply_to:
-        msg["In-Reply-To"] = in_reply_to
-    if references:
-        msg["References"] = references
-    apply_signature(msg, body, signature)
-    for att_path in (attachments or []):
-        import mimetypes
-        ctype, _ = mimetypes.guess_type(att_path)
-        maintype, subtype = (ctype or "application/octet-stream").split("/", 1)
-        with open(att_path, "rb") as af:
-            msg.add_attachment(af.read(), maintype=maintype, subtype=subtype,
-                               filename=os.path.basename(att_path))
-    return msg
-
-
-def smtp_send(addr, pw, msg):
-    ctx = ssl.create_default_context()
-    _, _, smtp_host, smtp_port = get_servers_for(addr)
-    with smtplib.SMTP(smtp_host, smtp_port) as s:
-        s.starttls(context=ctx)
-        s.login(addr, pw)
-        s.send_message(msg)
-
-
-def cmd_send(accounts, ident, to, subject, body, use_signature=True,
-             signature_name=None, attachments=None):
-    addr = resolve(accounts, ident)
-    to_addrs = [t.strip() for t in to.split(",") if t.strip()]
-    sig = get_signature(addr, signature_name) if use_signature else None
-    msg = build_send(addr, to_addrs, subject, body, signature=sig,
-                     attachments=attachments)
-    smtp_send(addr, accounts[addr], msg)
-    print(f"sent from {addr} to {', '.join(to_addrs)}")
-
-
-def cmd_reply(accounts, ident, uid, body, use_signature=True,
-              signature_name=None):
-    addr = resolve(accounts, ident)
-    im = imap_connect(addr, accounts[addr])
-    im.select("INBOX")
-    typ, data = im.uid("fetch", uid, "(RFC822)")
-    if typ != "OK" or not data or not data[0]:
-        sys.exit("message not found")
-    orig = BytesParser(policy=policy.default).parsebytes(data[0][1])
-    orig_from = parseaddr(str(orig["From"]))[1]
-    orig_subj = decode(orig["Subject"]) or ""
-    subj = orig_subj if orig_subj.lower().startswith("re:") else "Re: " + orig_subj
-    msg_id = str(orig["Message-ID"] or "").strip()
-    refs = str(orig["References"] or "").strip()
-    references = (refs + " " + msg_id).strip() if msg_id else refs
-    quoted = "\n".join("> " + l for l in msg_text(orig).splitlines()[:40])
-    full_body = body + "\n\nOn " + str(orig["Date"] or "") + ", " + decode(orig["From"]) + " wrote:\n" + quoted
-    sig = get_signature(addr, signature_name) if use_signature else None
-    msg = build_send(addr, [orig_from], subj, full_body,
-                     in_reply_to=msg_id or None, references=references or None,
-                     signature=sig)
-    smtp_send(addr, accounts[addr], msg)
-    im.uid("store", uid, "+FLAGS", "\\Answered")
-    im.logout()
-    print(f"replied from {addr} to {orig_from}")
-
-
-def cmd_signature(accounts, action, ident=None, text=None, html_file=None,
-                  name=None):
-    sigs = load_signatures()
-    if action == "set":
-        if not ident:
-            sys.exit("usage: musepost signature set <account> [--name VARIANT] [--text TXT] [--html-file PATH]")
-        addr = resolve(accounts, ident)
-        norm = normalize_sig_entry(sigs.get(addr))
-        vname = name or norm["default"]
-        cur = norm["variants"].get(vname, {})
-        if text is not None:
-            cur["text"] = text
-        if html_file:
-            with open(html_file, encoding="utf-8") as f:
-                cur["html"] = f.read()
-        if "text" not in cur:
-            cur["text"] = ""
-        if "html" not in cur:
-            cur["html"] = ""
-        norm["variants"][vname] = cur
-        sigs[addr] = norm
-        save_signatures(sigs)
-        print(f"signature '{vname}' set for {addr}")
-    elif action == "show":
-        if not ident:
-            sys.exit("usage: musepost signature show <account>")
-        addr = resolve(accounts, ident)
-        norm = normalize_sig_entry(sigs.get(addr))
-        if not norm["variants"]:
-            print(f"no signature for {addr}")
-        else:
-            print(f"--- signatures for {addr} (default: {norm['default']}) ---")
-            for vname in sorted(norm["variants"]):
-                v = norm["variants"][vname]
-                print(f"[{vname}] text: {(v.get('text') or '(none)')[:80]}")
-                print(f"[{vname}] html: {len(v.get('html') or '')} chars")
-    elif action == "clear":
-        if not ident:
-            sys.exit("usage: musepost signature clear <account> [--name VARIANT]")
-        addr = resolve(accounts, ident)
-        if name:
-            norm = normalize_sig_entry(sigs.get(addr))
-            norm["variants"].pop(name, None)
-            if norm["variants"]:
-                sigs[addr] = norm
+    elif "body" in result:
+        for key in ("from", "to", "date", "subject"):
+            print(terminal("{}: {}".format(key.title(), result.get(key, ""))))
+        print("-" * 60)
+        print(terminal(result["body"]))
+        if result.get("truncated"):
+            print("[Body truncated; omit --limit to read the full message.]")
+        for att in result.get("attachments", []):
+            print(
+                terminal("Attachment {index}: {filename} ({size} bytes)".format(**att))
+            )
+    elif "messages" in result:
+        for item in result["messages"]:
+            print(
+                terminal(
+                    "{} {} | {} | {}".format(
+                        " " if item.get("seen") else "*",
+                        item["uid"],
+                        item.get("from", ""),
+                        item.get("subject", ""),
+                    )
+                )
+            )
+        if not result["messages"]:
+            print("No matching messages.")
+    elif "accounts" in result:
+        for addr, data in result["accounts"].items():
+            if "error" in data:
+                print(terminal("{}  ERROR: {}".format(addr, data["error"]["message"])))
             else:
-                sigs.pop(addr, None)
-            save_signatures(sigs)
-            print(f"signature '{name}' cleared for {addr}")
-        else:
-            sigs.pop(addr, None)
-            save_signatures(sigs)
-            print(f"signatures cleared for {addr}")
+                print(
+                    terminal(
+                        "{}  unread={}".format(
+                            addr, data.get("unread", data.get("total", 0))
+                        )
+                    )
+                )
+                for item in data.get("messages", []):
+                    print(
+                        terminal(
+                            "  {} | {} | {}".format(
+                                item["uid"], item["from"], item["subject"]
+                            )
+                        )
+                    )
     else:
-        sys.exit("usage: musepost signature {set|show|clear} <account> [...] ")
+        print(terminal(json.dumps(result, indent=2, ensure_ascii=False)))
 
 
-def get_body(args):
-    if "--body" in args:
-        i = args.index("--body")
-        b = args[i + 1]
-        return b if b != "-" else sys.stdin.read()
+def error_data(exc, accounts):
+    return redact(
+        {"code": exc.code, "message": str(exc), "details": getattr(exc, "details", {})},
+        accounts,
+    )
+
+
+def body_text(args):
+    if args.body != "-":
+        return args.body
+    if sys.stdin.isatty():
+        raise UsageError("Supply --body text or pipe the message body through stdin.")
     return sys.stdin.read()
 
 
-def flag_value(rest, flag):
-    for i, a in enumerate(rest):
-        if a == flag and i + 1 < len(rest):
-            return rest[i + 1]
-    return None
+def preview(msg):
+    part = msg.get_body(preferencelist=("plain", "html"))
+    return {
+        "from": str(msg.get("From", "")),
+        "to": str(msg.get("To", "")),
+        "cc": str(msg.get("Cc", "")),
+        "subject": str(msg.get("Subject", "")),
+        "body": part.get_content() if part else "",
+        "attachments": [
+            {
+                "filename": p.get_filename(),
+                "content_type": p.get_content_type(),
+                "size": len(p.get_payload(decode=True) or b""),
+            }
+            for p in msg.iter_attachments()
+        ],
+    }
 
 
-def main():
-    if len(sys.argv) < 2 or sys.argv[1] in ("-h", "--help", "help"):
-        print(__doc__)
-        return
-    argv = sys.argv[1:]
-    as_json = False
-    if "--json" in argv:
-        as_json = True
-        argv = [a for a in argv if a != "--json"]
-    accounts = load_accounts()
-    if not accounts:
-        sys.exit("no accounts parsed from " + ACCESS_FILE)
-    cmd, rest = argv[0], argv[1:]
-    if cmd == "inboxes":
-        cmd_inboxes(accounts, as_json=as_json)
-    elif cmd == "unread":
-        ident = rest[0] if rest and not rest[0].startswith("--") else None
-        cmd_unread(accounts, ident, as_json=as_json)
-    elif cmd == "list" and rest:
-        cmd_list(accounts, rest[0], int(rest[1]) if len(rest) > 1 and rest[1].isdigit() else 10,
-                 as_json=as_json)
-    elif cmd == "read" and len(rest) >= 2:
-        cmd_read(accounts, rest[0], rest[1], as_json=as_json)
-    elif cmd == "search" and len(rest) >= 2:
-        cmd_search(accounts, rest[0], " ".join(rest[1:]), as_json=as_json)
-    elif cmd == "send" and rest:
-        to = subj = None
-        attachments = []
-        for i, a in enumerate(rest):
-            if a == "--to" and i + 1 < len(rest):
-                to = rest[i + 1]
-            if a == "--subject" and i + 1 < len(rest):
-                subj = rest[i + 1]
-            if a == "--attach" and i + 1 < len(rest):
-                attachments.append(rest[i + 1])
-        if not to or not subj:
-            sys.exit("usage: musepost send <account> --to A --subject S --body - [--no-signature] [--signature NAME] [--attach FILE]")
-        cmd_send(accounts, rest[0], to, subj, get_body(rest),
-                 use_signature="--no-signature" not in rest,
-                 signature_name=flag_value(rest, "--signature"),
-                 attachments=attachments or None)
-    elif cmd == "reply" and len(rest):
-        if len(rest) < 2:
-            sys.exit("usage: musepost reply <account> <uid> --body - [--no-signature] [--signature NAME]")
-        cmd_reply(accounts, rest[0], rest[1], get_body(rest),
-                  use_signature="--no-signature" not in rest,
-                  signature_name=flag_value(rest, "--signature"))
-    elif cmd == "signature" and rest:
-        action = rest[0]
-        ident = rest[1] if len(rest) > 1 else None
-        text = html_file = None
-        for i, a in enumerate(rest):
-            if a == "--text" and i + 1 < len(rest):
-                text = rest[i + 1]
-            if a == "--html-file" and i + 1 < len(rest):
-                html_file = rest[i + 1]
-        cmd_signature(accounts, action, ident, text, html_file,
-                      name=flag_value(rest, "--name"))
+def receipt_public(receipt):
+    return {k: v for k, v in receipt.items() if k != "fingerprint"}
+
+
+def receipt_exit(receipt):
+    return {"accepted": 0, "partial": 2, "uncertain": 3}.get(receipt["status"], 1)
+
+
+def submit(accounts, addr, msg, request_id, timeout, reply_context=None):
+    account = accounts[addr]
+    receipt, claimed = state.claim_request(request_id, addr, msg)
+    if not claimed:
+        return receipt_public(receipt), receipt_exit(receipt)
+    try:
+        receipt.update(
+            redact(
+                mail.submit_message(
+                    addr, account["password"], account, msg, timeout=timeout
+                ),
+                accounts,
+            )
+        )
+    except mail.MailError as exc:
+        receipt["status"] = exc.details.get("status", "failed")
+        if receipt["status"] == "not_submitted":
+            receipt["status"] = "failed"
+        receipt["error"] = error_data(exc, accounts)
+    except Exception:
+        receipt["status"] = "uncertain"
+        receipt["error"] = {
+            "code": "SUBMISSION_UNCERTAIN",
+            "message": "Submission outcome is unknown; check the server before making a new request.",
+            "details": {},
+        }
+
+    def persist():
+        try:
+            state.save_receipt(receipt)
+        except state.StateError:
+            warning = "Could not persist the submission outcome; the retry key remains protected."
+            if warning not in receipt["warnings"]:
+                receipt["warnings"].append(warning)
+
+    # Record acceptance before Sent/Answered network calls. Their failures must
+    # never erase evidence of acceptance or encourage a duplicate submission.
+    persist()
+    if receipt["status"] in ("accepted", "partial"):
+        try:
+            receipt["sent_copy"] = mail.archive_sent(
+                addr, account["password"], account, msg, timeout=timeout
+            )
+            if receipt["sent_copy"]["status"] == "unavailable":
+                receipt["warnings"].append(
+                    "Sent folder was not identified; configure sent_folder to save a copy."
+                )
+        except Exception:
+            receipt["sent_copy"] = {"status": "failed"}
+            receipt["warnings"].append(
+                "SMTP accepted the message, but the Sent copy could not be saved."
+            )
+        if reply_context:
+            try:
+                options = {"folder": reply_context["folder"], "timeout": timeout}
+                if reply_context.get("uidvalidity"):
+                    options["uidvalidity"] = reply_context["uidvalidity"]
+                mail.mark_answered(
+                    addr, account["password"], account, reply_context["uid"], **options
+                )
+                receipt["answered_flag"] = "saved"
+            except Exception:
+                receipt["answered_flag"] = "failed"
+                receipt["warnings"].append(
+                    "SMTP accepted the reply, but the original message's Answered flag could not be saved."
+                )
+        persist()
+    return receipt_public(receipt), receipt_exit(receipt)
+
+
+def compose(args, accounts, timeout):
+    addr = config.resolve(accounts, args.account)
+    account = accounts[addr]
+    body = body_text(args)
+    signature = (
+        None if args.no_signature else config.get_signature(addr, args.signature)
+    )
+    options = {
+        "display_name": account.get("display_name"),
+        "signature": signature,
+        "attachments": args.attach,
+    }
+    context = None
+    if args.command == "reply":
+        orig, original_body = mail.reply_source(
+            addr,
+            account["password"],
+            account,
+            args.uid,
+            folder=args.folder,
+            timeout=timeout,
+        )
+        recipients = mail.reply_recipients(orig)
+        subject = str(orig.get("Subject", ""))
+        if not subject.lower().startswith("re:"):
+            subject = "Re: " + subject
+        message_id = str(orig.get("Message-ID", "")).strip()
+        refs = str(orig.get("References", orig.get("In-Reply-To", ""))).strip()
+        options["in_reply_to"] = message_id or None
+        options["references"] = (refs + " " + message_id).strip() or None
+        body += "\n\nOn {}, {} wrote:\n{}".format(
+            orig.get("Date", ""),
+            orig.get("From", ""),
+            "\n".join("> " + line for line in original_body.splitlines()),
+        )
+        context = {
+            "uid": args.uid,
+            "folder": args.folder,
+            "uidvalidity": getattr(orig, "_musepost_uidvalidity", None),
+        }
     else:
-        sys.exit("unknown command. See: musepost help")
+        recipients, subject = args.to, args.subject
+        if args.cc:
+            options["cc"] = args.cc
+    msg = mail.create_message(addr, recipients, subject, body, **options)
+    if args.preview:
+        return {
+            "status": "preview",
+            "account": addr,
+            "message_id": str(msg["Message-ID"]),
+            "preview": preview(msg),
+        }, 0
+    if args.draft:
+        return {**state.create_draft(addr, msg, context), "preview": preview(msg)}, 0
+    return submit(
+        accounts, addr, msg, args.request_id or uuid.uuid4().hex, timeout, context
+    )
+
+
+def download(args, addr, account, timeout):
+    filename, content = mail.get_attachment(
+        addr,
+        account["password"],
+        account,
+        args.uid,
+        args.index,
+        folder=args.folder,
+        timeout=timeout,
+    )
+    destination = Path(args.output).expanduser()
+    if destination.is_dir():
+        filename = filename.replace("\\", "/").rsplit("/", 1)[-1]
+        filename = "".join(c for c in filename if ord(c) >= 32 and ord(c) != 127)
+        destination /= (
+            filename
+            if filename not in ("", ".", "..")
+            else "attachment-{}".format(args.index)
+        )
+    try:
+        fd = os.open(
+            str(destination),
+            os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0),
+            0o600,
+        )
+        with os.fdopen(fd, "wb") as stream:
+            stream.write(content)
+    except FileExistsError:
+        raise config.ConfigError(
+            "OUTPUT_EXISTS", "Attachment destination exists; choose a new file."
+        ) from None
+    except OSError:
+        raise config.ConfigError(
+            "OUTPUT_UNWRITABLE", "Could not write the attachment destination."
+        ) from None
+    return {
+        "status": "saved",
+        "account": addr,
+        "uid": str(args.uid),
+        "index": args.index,
+        "path": str(destination),
+        "size": len(content),
+    }, 0
+
+
+def dispatch(args, accounts):
+    timeout = getattr(args, "timeout", 30)
+    command = args.command
+    if command == "receipts":
+        return (
+            receipt_public(state.get_receipt(args.request_id))
+            if args.request_id
+            else {"receipts": [receipt_public(r) for r in state.list_receipts()]}
+        ), 0
+    if command == "drafts":
+        if args.action == "list":
+            return {"drafts": state.list_drafts()}, 0
+        metadata, msg = state.load_draft(args.draft_id)
+        if args.action == "show":
+            return {**metadata, "preview": preview(msg)}, 0
+        if args.action == "delete":
+            state.delete_draft(args.draft_id)
+            return {"status": "deleted", "draft_id": args.draft_id}, 0
+        addr = config.resolve(accounts, metadata["account"])
+        if parseaddr(str(msg.get("From", "")))[1].lower() != addr:
+            raise state.StateError(
+                "INVALID_STATE", "Draft sender does not match its configured account."
+            )
+        return submit(
+            accounts,
+            addr,
+            msg,
+            "draft:" + args.draft_id,
+            timeout,
+            metadata.get("reply_context"),
+        )
+    if command in ("inboxes", "unread"):
+        targets = (
+            [config.resolve(accounts, args.account)]
+            if getattr(args, "account", None)
+            else sorted(accounts)
+        )
+
+        def fetch(addr):
+            account = accounts[addr]
+            try:
+                if command == "inboxes":
+                    result = mail.inbox_status(
+                        addr, account["password"], account, timeout=timeout
+                    )
+                else:
+                    result = mail.list_messages(
+                        addr,
+                        account["password"],
+                        account,
+                        folder=args.folder,
+                        limit=args.limit,
+                        unread=True,
+                        timeout=timeout,
+                    )
+                    result["unread"] = result["total"]
+                return addr, result
+            except mail.MailError as exc:
+                return addr, {"error": error_data(exc, accounts)}
+            except Exception:
+                return addr, {
+                    "error": {
+                        "code": "MAILBOX_FAILED",
+                        "message": "Mailbox operation failed.",
+                        "details": {},
+                    }
+                }
+
+        with ThreadPoolExecutor(max_workers=min(4, len(targets))) as executor:
+            results = dict(executor.map(fetch, targets))
+        return {"accounts": results}, 1 if any(
+            "error" in v for v in results.values()
+        ) else 0
+    if command in ("send", "reply"):
+        return compose(args, accounts, timeout)
+    addr = config.resolve(accounts, args.account)
+    account = accounts[addr]
+    password = account["password"]
+    if command in ("read", "peek"):
+        return mail.read_message(
+            addr,
+            password,
+            account,
+            args.uid,
+            folder=args.folder,
+            mark_read=getattr(args, "mark_read", False),
+            max_chars=args.limit,
+            timeout=timeout,
+        ), 0
+    if command in ("list", "search"):
+        limit = (
+            (
+                args.limit
+                if args.limit is not None
+                else args.n
+                if args.n is not None
+                else 10
+            )
+            if command == "list"
+            else args.limit
+        )
+        return mail.list_messages(
+            addr,
+            password,
+            account,
+            folder=args.folder,
+            limit=limit,
+            query=" ".join(args.query) if command == "search" else None,
+            timeout=timeout,
+        ), 0
+    if command == "folders":
+        return {
+            "account": addr,
+            "folders": mail.folders(addr, password, account, timeout=timeout),
+        }, 0
+    if command == "attachment":
+        return download(args, addr, account, timeout)
+    if command == "signature":
+        if args.action == "show":
+            return {"account": addr, **config.signatures_for(addr)}, 0
+        if args.action == "clear":
+            config.clear_signature(addr, args.name)
+            return {"status": "cleared", "account": addr, "name": args.name}, 0
+        html = (
+            Path(args.html_file).expanduser().read_text(encoding="utf-8")
+            if args.html_file
+            else None
+        )
+        return {
+            "status": "saved",
+            "account": addr,
+            **config.set_signature(
+                addr, name=args.name, text=args.text, html=html, default=args.default
+            ),
+        }, 0
+    raise UsageError("Unknown command.")
+
+
+def main(argv=None):
+    argv = sys.argv[1:] if argv is None else list(argv)
+    parser = build_parser()
+    if not argv or argv == ["help"]:
+        parser.print_help()
+        return 0
+    accounts = {}
+    as_json = "--json" in argv
+    try:
+        try:
+            args = parser.parse_args(argv)
+        except SystemExit as exc:
+            return exc.code
+        as_json = getattr(args, "as_json", False)
+        local = args.command == "receipts" or (
+            args.command == "drafts" and args.action != "send"
+        )
+        if not local:
+            accounts = config.load_accounts(getattr(args, "config_path", None))
+        result, code = dispatch(args, accounts)
+        output(redact(result, accounts), as_json)
+        return code
+    except (UsageError, config.ConfigError, state.StateError, mail.MailError) as exc:
+        output({"error": error_data(exc, accounts)}, as_json)
+        return (
+            2
+            if isinstance(exc, UsageError)
+            else 3
+            if getattr(exc, "details", {}).get("status") == "uncertain"
+            else 1
+        )
+    except (OSError, ValueError, UnicodeError):
+        output(
+            {
+                "error": {
+                    "code": "OPERATION_FAILED",
+                    "message": "Could not complete the local operation.",
+                    "details": {},
+                }
+            },
+            as_json,
+        )
+        return 1
+    except KeyboardInterrupt:
+        output(
+            {
+                "error": {
+                    "code": "INTERRUPTED",
+                    "message": "Operation interrupted. Check its receipt before repeating a send.",
+                    "details": {},
+                }
+            },
+            as_json,
+        )
+        return 130
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())
