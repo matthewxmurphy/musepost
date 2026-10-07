@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """musepost - Taylor's API-driven multi-mailbox email client.
 
-Version: 2026.10.06.01
+Version: 2026.10.07.01
 Developed for Muse.ai agent emails.
 Credits: Taylor & Matthew Murphy - net30hosting.com
 
@@ -14,17 +14,22 @@ Usage:
   musepost list <account> [n=10] [--json]  recent messages
   musepost read <account> <uid> [--json]   full message body (text)
   musepost search <account> <query> [--json]  IMAP search (subject/from/body)
-  musepost reply <account> <uid> --body - [--no-signature]
-  musepost send <account> --to A --subject S --body - [--no-signature]
-  musepost signature set <account> [--text TXT] [--html-file PATH]
+  musepost reply <account> <uid> --body - [--no-signature] [--signature NAME]
+  musepost send <account> --to A --subject S --body - [--no-signature] [--signature NAME]
+  musepost signature set <account> [--name VARIANT] [--text TXT] [--html-file PATH]
   musepost signature show <account>
-  musepost signature clear <account>
+  musepost signature clear <account> [--name VARIANT]
 Account can be the full address or the domain part (e.g. boldteehub.com).
 
-Signatures: stored per email address in ~/.config/musepost/signatures.json
-(address -> {"text": ..., "html": ...}). send/reply apply the account's
-signature automatically unless --no-signature is passed. When an HTML
-signature exists the message goes out multipart (plain + HTML).
+Signatures: stored per email address in ~/.config/musepost/signatures.json.
+Each address can hold multiple named variants (e.g. "desktop", "iphone"):
+{address: {"variants": {"desktop": {"text":..,"html":..},
+"iphone": {"text":..,"html":..}}, "default": "desktop"}}.
+Old flat {"text":..,"html":..} entries migrate automatically to a "desktop"
+variant. send/reply pick a variant at RANDOM when more than one exists, so a
+message can look phone-sent ("Sent from my iPhone") or desktop-sent
+(branded HTML). --signature NAME forces one variant; --no-signature skips.
+When an HTML signature exists the message goes out multipart (plain + HTML).
 
 --json: every read command (inboxes, unread, list, read, search) emits a
 JSON feed instead of human text, for programmatic consumers.
@@ -32,6 +37,7 @@ JSON feed instead of human text, for programmatic consumers.
 import imaplib
 import json
 import os
+import random
 import re
 import smtplib
 import ssl
@@ -40,12 +46,43 @@ from email import policy
 from email.header import decode_header
 from email.message import EmailMessage
 from email.parser import BytesParser
-from email.utils import formatdate, getaddresses, make_msgid, parseaddr
+from email.utils import formataddr, formatdate, getaddresses, make_msgid, parseaddr
 
 ACCESS_FILE = "/home/taylor/TAYLOR-ACCESS.txt"
 SIG_FILE = os.path.expanduser("~/.config/musepost/signatures.json")
 IMAP_HOST, IMAP_PORT = "mail.net30hosting.com", 993
 SMTP_HOST, SMTP_PORT = "mail.net30hosting.com", 587
+
+def load_server_config():
+    path = os.path.expanduser("~/.config/musepost/servers.json")
+    try:
+        with open(path) as f:
+            return json.load(f)
+    except (FileNotFoundError, json.JSONDecodeError):
+        return {}
+
+def get_servers_for(addr):
+    cfg = load_server_config().get(addr, {})
+    return (
+        cfg.get("imap_host", IMAP_HOST),
+        cfg.get("imap_port", IMAP_PORT),
+        cfg.get("smtp_host", SMTP_HOST),
+        cfg.get("smtp_port", SMTP_PORT),
+    )
+
+def load_display_names():
+    path = os.path.expanduser("~/.config/musepost/display_names.json")
+    try:
+        with open(path) as f:
+            return json.load(f)
+    except (FileNotFoundError, json.JSONDecodeError):
+        return {}
+
+def format_from(addr):
+    name = load_display_names().get(addr)
+    if name:
+        return formataddr((name, addr))
+    return addr
 
 
 def load_accounts():
@@ -74,7 +111,7 @@ def load_accounts():
 
 
 def load_signatures():
-    """Per-address signature rules: {address: {"text": str, "html": str}}."""
+    """Per-address signature rules (see module docstring for format)."""
     try:
         with open(SIG_FILE, encoding="utf-8") as f:
             data = json.load(f)
@@ -90,10 +127,39 @@ def save_signatures(sigs):
     os.chmod(SIG_FILE, 0o600)
 
 
-def get_signature(addr):
-    sig = load_signatures().get(addr.lower())
-    if not sig:
+def normalize_sig_entry(entry):
+    """Migrate legacy flat {"text":..,"html":..} to {"variants":{...},"default":..}."""
+    if not isinstance(entry, dict):
+        return {"variants": {}, "default": "desktop"}
+    if "variants" in entry:
+        variants = entry.get("variants") or {}
+        default = entry.get("default") or "desktop"
+        if default not in variants and variants:
+            default = sorted(variants)[0]
+        return {"variants": variants, "default": default}
+    text = (entry.get("text") or "").strip()
+    html_sig = (entry.get("html") or "").strip()
+    if not text and not html_sig:
+        return {"variants": {}, "default": "desktop"}
+    return {"variants": {"desktop": {"text": text, "html": html_sig}},
+            "default": "desktop"}
+
+
+def get_signature(addr, name=None):
+    """Pick a signature variant. Random when several exist and none named."""
+    norm = normalize_sig_entry(load_signatures().get(addr.lower()))
+    variants = norm["variants"]
+    if not variants:
         return None
+    if name:
+        sig = variants.get(name)
+        if not sig:
+            sys.exit(f"unknown signature '{name}' for {addr} "
+                     f"(have: {', '.join(sorted(variants))})")
+    elif len(variants) == 1:
+        sig = next(iter(variants.values()))
+    else:
+        sig = random.choice(list(variants.values()))
     text = (sig.get("text") or "").strip()
     html_sig = (sig.get("html") or "").strip()
     if not text and not html_sig:
@@ -115,7 +181,8 @@ def resolve(accounts, ident):
 
 def imap_connect(addr, pw):
     ctx = ssl.create_default_context()
-    im = imaplib.IMAP4_SSL(IMAP_HOST, IMAP_PORT, ssl_context=ctx)
+    imap_host, imap_port, _, _ = get_servers_for(addr)
+    im = imaplib.IMAP4_SSL(imap_host, imap_port, ssl_context=ctx)
     im.login(addr, pw)
     return im
 
@@ -324,9 +391,9 @@ def apply_signature(msg, body_text, signature):
 
 
 def build_send(addr, to_addrs, subject, body, in_reply_to=None, references=None,
-               signature=None):
+               signature=None, attachments=None):
     msg = EmailMessage()
-    msg["From"] = addr
+    msg["From"] = format_from(addr)
     msg["To"] = ", ".join(to_addrs)
     msg["Subject"] = subject
     msg["Date"] = formatdate(localtime=True)
@@ -336,27 +403,38 @@ def build_send(addr, to_addrs, subject, body, in_reply_to=None, references=None,
     if references:
         msg["References"] = references
     apply_signature(msg, body, signature)
+    for att_path in (attachments or []):
+        import mimetypes
+        ctype, _ = mimetypes.guess_type(att_path)
+        maintype, subtype = (ctype or "application/octet-stream").split("/", 1)
+        with open(att_path, "rb") as af:
+            msg.add_attachment(af.read(), maintype=maintype, subtype=subtype,
+                               filename=os.path.basename(att_path))
     return msg
 
 
 def smtp_send(addr, pw, msg):
     ctx = ssl.create_default_context()
-    with smtplib.SMTP(SMTP_HOST, SMTP_PORT) as s:
+    _, _, smtp_host, smtp_port = get_servers_for(addr)
+    with smtplib.SMTP(smtp_host, smtp_port) as s:
         s.starttls(context=ctx)
         s.login(addr, pw)
         s.send_message(msg)
 
 
-def cmd_send(accounts, ident, to, subject, body, use_signature=True):
+def cmd_send(accounts, ident, to, subject, body, use_signature=True,
+             signature_name=None, attachments=None):
     addr = resolve(accounts, ident)
     to_addrs = [t.strip() for t in to.split(",") if t.strip()]
-    sig = get_signature(addr) if use_signature else None
-    msg = build_send(addr, to_addrs, subject, body, signature=sig)
+    sig = get_signature(addr, signature_name) if use_signature else None
+    msg = build_send(addr, to_addrs, subject, body, signature=sig,
+                     attachments=attachments)
     smtp_send(addr, accounts[addr], msg)
     print(f"sent from {addr} to {', '.join(to_addrs)}")
 
 
-def cmd_reply(accounts, ident, uid, body, use_signature=True):
+def cmd_reply(accounts, ident, uid, body, use_signature=True,
+              signature_name=None):
     addr = resolve(accounts, ident)
     im = imap_connect(addr, accounts[addr])
     im.select("INBOX")
@@ -372,7 +450,7 @@ def cmd_reply(accounts, ident, uid, body, use_signature=True):
     references = (refs + " " + msg_id).strip() if msg_id else refs
     quoted = "\n".join("> " + l for l in msg_text(orig).splitlines()[:40])
     full_body = body + "\n\nOn " + str(orig["Date"] or "") + ", " + decode(orig["From"]) + " wrote:\n" + quoted
-    sig = get_signature(addr) if use_signature else None
+    sig = get_signature(addr, signature_name) if use_signature else None
     msg = build_send(addr, [orig_from], subj, full_body,
                      in_reply_to=msg_id or None, references=references or None,
                      signature=sig)
@@ -382,13 +460,16 @@ def cmd_reply(accounts, ident, uid, body, use_signature=True):
     print(f"replied from {addr} to {orig_from}")
 
 
-def cmd_signature(accounts, action, ident=None, text=None, html_file=None):
+def cmd_signature(accounts, action, ident=None, text=None, html_file=None,
+                  name=None):
     sigs = load_signatures()
     if action == "set":
         if not ident:
-            sys.exit("usage: musepost signature set <account> [--text TXT] [--html-file PATH]")
+            sys.exit("usage: musepost signature set <account> [--name VARIANT] [--text TXT] [--html-file PATH]")
         addr = resolve(accounts, ident)
-        cur = sigs.get(addr, {})
+        norm = normalize_sig_entry(sigs.get(addr))
+        vname = name or norm["default"]
+        cur = norm["variants"].get(vname, {})
         if text is not None:
             cur["text"] = text
         if html_file:
@@ -398,28 +479,40 @@ def cmd_signature(accounts, action, ident=None, text=None, html_file=None):
             cur["text"] = ""
         if "html" not in cur:
             cur["html"] = ""
-        sigs[addr] = cur
+        norm["variants"][vname] = cur
+        sigs[addr] = norm
         save_signatures(sigs)
-        print(f"signature set for {addr}")
+        print(f"signature '{vname}' set for {addr}")
     elif action == "show":
         if not ident:
             sys.exit("usage: musepost signature show <account>")
         addr = resolve(accounts, ident)
-        sig = sigs.get(addr)
-        if not sig:
+        norm = normalize_sig_entry(sigs.get(addr))
+        if not norm["variants"]:
             print(f"no signature for {addr}")
         else:
-            print(f"--- text signature for {addr} ---")
-            print(sig.get("text") or "(none)")
-            print(f"--- html signature for {addr} ({len(sig.get('html') or '')} chars) ---")
-            print(sig.get("html") or "(none)")
+            print(f"--- signatures for {addr} (default: {norm['default']}) ---")
+            for vname in sorted(norm["variants"]):
+                v = norm["variants"][vname]
+                print(f"[{vname}] text: {(v.get('text') or '(none)')[:80]}")
+                print(f"[{vname}] html: {len(v.get('html') or '')} chars")
     elif action == "clear":
         if not ident:
-            sys.exit("usage: musepost signature clear <account>")
+            sys.exit("usage: musepost signature clear <account> [--name VARIANT]")
         addr = resolve(accounts, ident)
-        sigs.pop(addr, None)
-        save_signatures(sigs)
-        print(f"signature cleared for {addr}")
+        if name:
+            norm = normalize_sig_entry(sigs.get(addr))
+            norm["variants"].pop(name, None)
+            if norm["variants"]:
+                sigs[addr] = norm
+            else:
+                sigs.pop(addr, None)
+            save_signatures(sigs)
+            print(f"signature '{name}' cleared for {addr}")
+        else:
+            sigs.pop(addr, None)
+            save_signatures(sigs)
+            print(f"signatures cleared for {addr}")
     else:
         sys.exit("usage: musepost signature {set|show|clear} <account> [...] ")
 
@@ -430,6 +523,13 @@ def get_body(args):
         b = args[i + 1]
         return b if b != "-" else sys.stdin.read()
     return sys.stdin.read()
+
+
+def flag_value(rest, flag):
+    for i, a in enumerate(rest):
+        if a == flag and i + 1 < len(rest):
+            return rest[i + 1]
+    return None
 
 
 def main():
@@ -459,18 +559,26 @@ def main():
         cmd_search(accounts, rest[0], " ".join(rest[1:]), as_json=as_json)
     elif cmd == "send" and rest:
         to = subj = None
+        attachments = []
         for i, a in enumerate(rest):
             if a == "--to" and i + 1 < len(rest):
                 to = rest[i + 1]
             if a == "--subject" and i + 1 < len(rest):
                 subj = rest[i + 1]
+            if a == "--attach" and i + 1 < len(rest):
+                attachments.append(rest[i + 1])
         if not to or not subj:
-            sys.exit("usage: musepost send <account> --to A --subject S --body - [--no-signature]")
+            sys.exit("usage: musepost send <account> --to A --subject S --body - [--no-signature] [--signature NAME] [--attach FILE]")
         cmd_send(accounts, rest[0], to, subj, get_body(rest),
-                 use_signature="--no-signature" not in rest)
-    elif cmd == "reply" and len(rest) >= 2:
+                 use_signature="--no-signature" not in rest,
+                 signature_name=flag_value(rest, "--signature"),
+                 attachments=attachments or None)
+    elif cmd == "reply" and len(rest):
+        if len(rest) < 2:
+            sys.exit("usage: musepost reply <account> <uid> --body - [--no-signature] [--signature NAME]")
         cmd_reply(accounts, rest[0], rest[1], get_body(rest),
-                  use_signature="--no-signature" not in rest)
+                  use_signature="--no-signature" not in rest,
+                  signature_name=flag_value(rest, "--signature"))
     elif cmd == "signature" and rest:
         action = rest[0]
         ident = rest[1] if len(rest) > 1 else None
@@ -480,7 +588,8 @@ def main():
                 text = rest[i + 1]
             if a == "--html-file" and i + 1 < len(rest):
                 html_file = rest[i + 1]
-        cmd_signature(accounts, action, ident, text, html_file)
+        cmd_signature(accounts, action, ident, text, html_file,
+                      name=flag_value(rest, "--name"))
     else:
         sys.exit("unknown command. See: musepost help")
 
