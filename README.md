@@ -33,25 +33,58 @@ EOF
 
 ## Setup
 
-1. Create a credentials file (mode `0600`) with one block per mailbox:
+1. Store a private JSON file outside this checkout, owned by the user running
+   MusePost, with exact mode `0600`. Create its directory with mode `0700` and
+   use `umask 077` before writing credentials. The values below are placeholders:
 
+```json
+{"accounts": {
+  "owner+alerts@example.test": {"password": "replace-locally"},
+  "taylor@example.test": {"password": "replace-locally"}
+}}
 ```
-taylor@example.com
-Username: taylor@example.com
-New password: your-password-here
-Mailbox quota: 128 MB
+
+2. Select that file without modifying source:
+
+```sh
+export MUSEPOST_CONFIG="$HOME/.config/musepost/accounts.json"
+chmod 600 "$MUSEPOST_CONFIG"
 ```
 
-2. Point `musepost` at it by editing `ACCESS_FILE` near the top of the script
-   (default: `/home/taylor/TAYLOR-ACCESS.txt`).
-
-3. Make it executable and put it on your `PATH`:
+3. Make `musepost` executable and put it on your `PATH`:
 
 ```sh
 chmod 755 musepost
 ```
 
-**Never commit your credentials file.**
+If `MUSEPOST_CONFIG` is unset, the historical `/home/taylor/TAYLOR-ACCESS.txt`
+path remains the fallback. Legacy blocks still work with any validated bare
+mailbox address:
+
+```text
+owner@example.test
+Username: owner@example.test
+New password: replace-locally
+Mailbox quota: 128 MB
+```
+
+`Address and username: owner@example.test` is also supported. Addresses are
+normalized to lowercase for compatibility. Supply bare ASCII addresses without display
+names, whitespace or control characters; use ASCII/Punycode domain names.
+Quoted local parts without whitespace are supported, including embedded `@`. Duplicate normalized addresses, missing
+or redacted passwords, mismatched usernames and multiple passwords per block
+are rejected; JSON accepts only the `accounts` map and one `password` per record.
+Use full addresses when several mailboxes share a domain: a domain shortcut
+fails on ambiguity instead of choosing a mailbox.
+
+The file must be regular, singly linked, owned by the current effective user,
+and exactly `0600`; final-component symlinks, directories and FIFOs are rejected
+before contents are read. Keep its parent directories controlled by your user.
+An invalid explicit path fails without falling back to another credential file.
+No permissions or ownership are changed automatically.
+
+**Never commit credentials.** Configuration loading itself opens no mailbox and
+sends no email. Existing `send` and `reply` commands are explicit operations.
 
 ## Usage
 
@@ -103,8 +136,7 @@ musepost signature clear taylor@taylorxquinn.com
 ```
 
 Signatures are stored per email address in `~/.config/musepost/signatures.json`
-(address, password, and signature rules travel together, one record per
-mailbox). They are applied automatically to sent messages and replies --
+(signature rules only; passwords remain in the separate credentials file). They are applied automatically to sent messages and replies --
 multipart (plain + HTML) when an HTML signature exists.
 Use `--no-signature` on any send or reply to skip it.
 
@@ -120,8 +152,8 @@ musepost read taylorxquinn.com 12 --json
 
 ## Security Notes
 
-- Passwords are read at runtime from your `0600` credentials file and never
-  printed, logged, or stored elsewhere by this tool.
+- Credentials are read at runtime after the ownership/type/mode checks above.
+  Configuration errors do not include credential contents.
 - All connections use TLS (IMAP SSL on 993, SMTP STARTTLS on 587).
 
 ## Display Names
@@ -172,7 +204,9 @@ EOF
 
 ## Versioning
 
-`YYYY.MM.DD.BUILD` — date plus an incrementing build number for the day.
+Historical versions above are preserved. Future releases use `YYYY.M.DD.XXX`
+(America/Chicago; unpadded month, two-digit day, daily counter `001`–`999`).
+This source fix does not reserve or distribute a new release.
 
 ## Developed For
 
@@ -181,3 +215,29 @@ EOF
 ## Credits
 
 Taylor & Matthew Murphy — [net30hosting.com](https://net30hosting.com)
+
+
+## Development and verification
+
+Run the offline suite with `python3 -m unittest discover -s tests -v`.
+It uses synthetic files, blocks mail connections, checks private-file rejection,
+multiple mailbox identities/domain ambiguity, safe CLI errors, explicit command
+dispatch and certificate validation/TLS ordering through transport doubles.
+Python 3.9 and 3.14 were checked for this source change. Actual mailbox login,
+provider delivery and operating-system versions beyond the test host remain
+separate acceptance work. Existing message-reading and sending behavior is not
+expanded by this configuration change.
+
+See [RUNBOOK.md](RUNBOOK.md) for operations, architecture and rollback and
+[CHANGELOG.md](CHANGELOG.md) for source changes. Report reproducible bugs with
+sanitized fixtures through this repository's issues; propose scoped PRs with the
+suite result. Do not paste credentials or private messages into issues/PRs.
+
+Engineering SOP adoption: this scoped change follows the
+[shared SOP](https://github.com/matthewxmurphy/developer-standards), with review
+and exact candidate scanning. Portable checker/CI enforcement, full metadata and
+complete license/notices still require a separate owner-reviewed adoption step.
+No license grant is inferred from this repository's missing license file;
+preserve existing author credits and obtain applicable terms before distribution.
+Maintained by Matthew X Murphy, [MatthewxMurphy.com](https://MatthewxMurphy.com),
+[Built Not Begged](https://builtnotbegged.com), alongside the existing credits.

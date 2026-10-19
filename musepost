@@ -6,7 +6,7 @@ Developed for Muse.ai agent emails.
 Credits: Taylor & Matthew Murphy - net30hosting.com
 
 Text-based, stdlib-only. Reads credentials at runtime from
-/home/taylor/TAYLOR-ACCESS.txt (0600) and never prints them.
+MUSEPOST_CONFIG, or /home/taylor/TAYLOR-ACCESS.txt (0600).
 
 Usage:
   musepost inboxes [--json]              list accounts + unread counts
@@ -41,9 +41,12 @@ import random
 import re
 import smtplib
 import ssl
+import stat
 import sys
 from email import policy
+from email.errors import HeaderParseError
 from email.header import decode_header
+from email.headerregistry import Address
 from email.message import EmailMessage
 from email.parser import BytesParser
 from email.utils import formataddr, formatdate, getaddresses, make_msgid, parseaddr
@@ -85,28 +88,106 @@ def format_from(addr):
     return addr
 
 
-def load_accounts():
-    """Parse TAYLOR-ACCESS.txt -> {address: password}."""
+class AccountConfigError(ValueError):
+    """Safe configuration diagnostics: never interpolate credential contents."""
+
+
+def _mailbox_address(value):
+    """Validate a bare address, retaining the client's case-insensitive lookup."""
+    if not isinstance(value, str) or not value.isascii() or len(value) > 254 or any(
+            ord(c) <= 32 or ord(c) == 127 for c in value):
+        raise AccountConfigError("invalid mailbox address")
+    try:
+        parsed = Address(addr_spec=value)
+        if not parsed.username or not parsed.domain or parsed.addr_spec != value:
+            raise ValueError
+    except (ValueError, IndexError, HeaderParseError):
+        raise AccountConfigError("invalid mailbox address") from None
+    return value.lower()
+
+
+def _unique_object(pairs):
+    result = {}
+    for key, value in pairs:
+        if key in result:
+            raise AccountConfigError("duplicate configuration key")
+        result[key] = value
+    return result
+
+
+def load_accounts(path=None):
+    """Read private JSON or legacy blocks without opening any mail connection.
+
+    Explicit path precedes MUSEPOST_CONFIG, then the historical ACCESS_FILE.
+    Check the opened descriptor before reading; O_NONBLOCK prevents a FIFO from
+    hanging before its type can be rejected. The final component cannot be a
+    symlink. Keep the parent directory controlled by the operating user too.
+    """
+    path = path if path is not None else os.environ.get("MUSEPOST_CONFIG", ACCESS_FILE)
+    if not path or not hasattr(os, "O_NOFOLLOW"):
+        raise AccountConfigError("private credential file unavailable")
+    try:
+        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+        with os.fdopen(fd, encoding="utf-8") as stream:
+            info = os.fstat(stream.fileno())
+            if (not stat.S_ISREG(info.st_mode) or info.st_uid != os.geteuid()
+                    or stat.S_IMODE(info.st_mode) != 0o600 or info.st_nlink != 1):
+                raise AccountConfigError("credential file must be owned by this user, regular, singly linked and mode 0600")
+            text = stream.read()
+    except (OSError, UnicodeError):
+        raise AccountConfigError("cannot read private credential file") from None
+
     accounts = {}
-    cur_addr, cur_pw = None, None
-    with open(ACCESS_FILE, encoding="utf-8", errors="replace") as f:
-        for line in f:
-            line = line.strip()
-            m = re.match(r"^(taylor@[A-Za-z0-9.\-]+)$", line)
-            if not m:
-                m = re.match(r"^address and username:\s*(taylor@[A-Za-z0-9.\-]+)$", line, re.I)
-            if m:
-                if cur_addr and cur_pw:
-                    accounts[cur_addr] = cur_pw
-                cur_addr, cur_pw = m.group(1).lower(), None
+
+    def add(address, password):
+        address = _mailbox_address(address)
+        if address in accounts:
+            raise AccountConfigError("duplicate mailbox address")
+        if (not isinstance(password, str) or not password
+                or password.lower() == "<redacted>" or "\x00" in password
+                or "\r" in password or "\n" in password):
+            raise AccountConfigError("missing or invalid mailbox password")
+        accounts[address] = password
+
+    if text.lstrip().startswith("{"):
+        try:
+            data = json.loads(text, object_pairs_hook=_unique_object)
+        except (ValueError, RecursionError):
+            raise AccountConfigError("invalid account configuration") from None
+        if (not isinstance(data, dict) or set(data) != {"accounts"}
+                or not isinstance(data["accounts"], dict)):
+            raise AccountConfigError("expected an accounts object")
+        for address, record in data["accounts"].items():
+            if not isinstance(record, dict) or set(record) != {"password"}:
+                raise AccountConfigError("expected one password per account")
+            add(address, record["password"])
+    else:
+        current, password = None, None
+        for raw_line in text.splitlines():
+            line = raw_line.strip()
+            match = re.match(r"^(?:new\s+)?password:\s*(.*)$", line, re.I)
+            if match:
+                if current is not None:
+                    if password is not None:
+                        raise AccountConfigError("multiple passwords in mailbox block")
+                    password = match.group(1)
                 continue
-            m = re.match(r"^(?:new\s+)?password:\s*(.+)$", line, re.I)
-            if m and cur_addr and not cur_pw:
-                pw = m.group(1).strip()
-                if pw and pw.lower() != "<redacted>":
-                    cur_pw = pw
-    if cur_addr and cur_pw:
-        accounts[cur_addr] = cur_pw
+            username = re.match(r"^username:\s*(.*)$", line, re.I)
+            if username:
+                if current is not None and _mailbox_address(username.group(1)) != current:
+                    raise AccountConfigError("mailbox username does not match address")
+                continue
+            labelled = re.match(r"^address and username:\s*(.*)$", line, re.I)
+            if labelled or "@" in line:
+                if current is not None:
+                    add(current, password)
+                current = _mailbox_address(labelled.group(1) if labelled else line)
+                password = None
+                continue
+        if current is not None:
+            add(current, password)
+    if not accounts:
+        raise AccountConfigError("no mailbox accounts configured")
     return accounts
 
 
@@ -397,7 +478,7 @@ def build_send(addr, to_addrs, subject, body, in_reply_to=None, references=None,
     msg["To"] = ", ".join(to_addrs)
     msg["Subject"] = subject
     msg["Date"] = formatdate(localtime=True)
-    msg["Message-ID"] = make_msgid(domain=addr.split("@")[1])
+    msg["Message-ID"] = make_msgid(domain=addr.rsplit("@", 1)[1])
     if in_reply_to:
         msg["In-Reply-To"] = in_reply_to
     if references:
@@ -541,9 +622,10 @@ def main():
     if "--json" in argv:
         as_json = True
         argv = [a for a in argv if a != "--json"]
-    accounts = load_accounts()
-    if not accounts:
-        sys.exit("no accounts parsed from " + ACCESS_FILE)
+    try:
+        accounts = load_accounts()
+    except AccountConfigError as error:
+        sys.exit("account configuration: " + str(error))
     cmd, rest = argv[0], argv[1:]
     if cmd == "inboxes":
         cmd_inboxes(accounts, as_json=as_json)
